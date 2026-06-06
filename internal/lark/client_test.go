@@ -212,6 +212,50 @@ func TestSendRootAndReplyMessageJSON(t *testing.T) {
 	}
 }
 
+func TestSendTextMessageJSON(t *testing.T) {
+	var tokenRequests int
+	var sendRequests int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case tenantTokenPath:
+			tokenRequests++
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"tenant_access_token": "token-a",
+				"expire":              3600,
+			})
+		case sendMessagePath:
+			sendRequests++
+			if got := r.URL.Query().Get("receive_id_type"); got != "chat_id" {
+				t.Fatalf("receive_id_type = %q, want chat_id", got)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer token-a" {
+				t.Fatalf("send Authorization = %q, want Bearer token-a", got)
+			}
+			assertPlainSendRequest(t, r, "oc_boot", "exec-over-lark server ready")
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"data": map[string]any{"message_id": "om_boot"},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	if err := client.SendTextMessage(context.Background(), "oc_boot", "exec-over-lark server ready"); err != nil {
+		t.Fatalf("SendTextMessage returned error: %v", err)
+	}
+	if tokenRequests != 1 {
+		t.Fatalf("tokenRequests = %d, want 1", tokenRequests)
+	}
+	if sendRequests != 1 {
+		t.Fatalf("sendRequests = %d, want 1", sendRequests)
+	}
+}
+
 func TestSendRootMessageIncludesLarkErrorBodyForNon2xx(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -445,6 +489,32 @@ func assertRootSendRequest(t *testing.T, r *http.Request, wantChatID, wantMentio
 		t.Fatalf("msg_type = %q, want text", req.MsgType)
 	}
 	assertTextContent(t, req.Content, wantMentionOpenID, wantText)
+}
+
+func assertPlainSendRequest(t *testing.T, r *http.Request, wantChatID, wantText string) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Fatalf("method = %s, want POST", r.Method)
+	}
+	var req messageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		t.Fatalf("decode send request: %v", err)
+	}
+	if req.ReceiveID != wantChatID {
+		t.Fatalf("receive_id = %q, want %q", req.ReceiveID, wantChatID)
+	}
+	if req.MsgType != MessageTypeText {
+		t.Fatalf("msg_type = %q, want text", req.MsgType)
+	}
+	var content struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(req.Content), &content); err != nil {
+		t.Fatalf("decode text content: %v", err)
+	}
+	if content.Text != wantText {
+		t.Fatalf("content text = %q, want %q", content.Text, wantText)
+	}
 }
 
 func assertReplyRequest(t *testing.T, r *http.Request, wantMentionOpenID, wantText string) {

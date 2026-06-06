@@ -14,6 +14,7 @@ import (
 	"time"
 
 	gorillaws "github.com/gorilla/websocket"
+	"github.com/hachiwii/exec-over-lark/internal/bootstrap"
 	"github.com/hachiwii/exec-over-lark/internal/daemon"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
 	sdkws "github.com/larksuite/oapi-sdk-go/v3/ws"
@@ -26,9 +27,10 @@ type websocketEndpointProvider interface {
 }
 
 type larkWebSocketEventSource struct {
-	client websocketEndpointProvider
-	dialer *gorillaws.Dialer
-	stderr io.Writer
+	client          websocketEndpointProvider
+	dialer          *gorillaws.Dialer
+	stderr          io.Writer
+	bootstrapSender bootstrap.Sender
 }
 
 type wsReconnectError struct {
@@ -48,7 +50,7 @@ type wsChunkSet struct {
 	chunks [][]byte
 }
 
-func newLarkWebSocketEventSource(client websocketEndpointProvider, stderr io.Writer) daemon.EventSource {
+func newLarkWebSocketEventSource(client websocketEndpointProvider, stderr io.Writer) *larkWebSocketEventSource {
 	return &larkWebSocketEventSource{
 		client: client,
 		dialer: gorillaws.DefaultDialer,
@@ -237,6 +239,16 @@ func (s *larkWebSocketEventSource) handleFrame(
 }
 
 func (s *larkWebSocketEventSource) handlePayload(ctx context.Context, payload []byte, selfBotOpenID string, handler daemon.EventHandler) error {
+	if s.bootstrapSender != nil {
+		err := bootstrap.HandleEventJSON(ctx, s.bootstrapSender, payload, selfBotOpenID)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, bootstrap.ErrIgnoredEvent) {
+			return err
+		}
+	}
+
 	event, err := lark.ParseMessageReceiveEvent(payload, selfBotOpenID)
 	if errors.Is(err, lark.ErrIgnoredEvent) {
 		return nil

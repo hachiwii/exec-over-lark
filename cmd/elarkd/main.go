@@ -63,6 +63,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "elarkd: resolve self bot open_id: %v\n", err)
 			return 1
 		}
+		eventSource.bootstrapSender = larkClient
 		remote, err := daemon.NewRemoteDaemon(daemon.RemoteOptions{
 			Config:        daemon.RemoteConfigFromConfig(cfg),
 			EventSource:   eventSource,

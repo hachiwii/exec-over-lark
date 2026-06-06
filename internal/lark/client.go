@@ -220,6 +220,26 @@ func (c *Client) SendRootMessage(ctx context.Context, chatID, mentionOpenID, tex
 	return RootMessage{MessageID: messageID}, nil
 }
 
+func (c *Client) SendTextMessage(ctx context.Context, chatID, text string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return errors.New("chatID is required")
+	}
+
+	content, err := TextContent(text)
+	if err != nil {
+		return err
+	}
+
+	query := url.Values{"receive_id_type": []string{"chat_id"}}
+	req := messageRequest{
+		ReceiveID: chatID,
+		MsgType:   MessageTypeText,
+		Content:   content,
+	}
+	return c.doAuthorizedJSON(ctx, http.MethodPost, sendMessagePath, query, req, nil)
+}
+
 func (c *Client) ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
 	if strings.TrimSpace(chatID) == "" {
 		return "", errors.New("chatID is required")
