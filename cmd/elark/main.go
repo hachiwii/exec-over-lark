@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
+	"github.com/hachiwii/exec-over-lark/internal/doctor"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
+	"github.com/hachiwii/exec-over-lark/internal/lark"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -39,15 +41,17 @@ type daemonClient interface {
 
 type dialFunc func(context.Context, string) (daemonClient, error)
 type daemonStarter func(context.Context, string, io.Writer, io.Writer) error
+type larkClientFactory func(*config.Config) (doctor.LarkClient, error)
 
 type app struct {
 	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
 
-	dial        dialFunc
-	startDaemon daemonStarter
-	getenv      func(string) string
+	dial          dialFunc
+	startDaemon   daemonStarter
+	newLarkClient larkClientFactory
+	getenv        func(string) string
 }
 
 type ttyMode int
@@ -114,7 +118,13 @@ func newApp() *app {
 		stderr:      os.Stderr,
 		dial:        dialIPC,
 		startDaemon: startDaemonProcess,
-		getenv:      os.Getenv,
+		newLarkClient: func(cfg *config.Config) (doctor.LarkClient, error) {
+			return lark.NewClient(lark.ClientConfig{
+				AppID:     cfg.Lark.AppID,
+				AppSecret: cfg.Lark.AppSecret,
+			})
+		},
+		getenv: os.Getenv,
 	}
 }
 
@@ -479,33 +489,67 @@ func (a *app) runHosts(cmd parsedCommand) int {
 }
 
 func (a *app) runDoctor(cmd parsedCommand) int {
-	cfg, path, err := loadCLIConfig(cmd.opts.configPath, true)
-	if err != nil {
-		fmt.Fprintf(a.stderr, "config: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(a.stdout, "config: ok (%s)\n", path)
+	ctx, cancel := commandContext(cmd.opts)
+	defer cancel()
 
-	if cmd.host != "" {
-		if _, ok := cfg.Hosts[cmd.host]; ok {
-			fmt.Fprintf(a.stdout, "host: ok (%s)\n", cmd.host)
-		} else {
-			fmt.Fprintf(a.stderr, "host: missing (%s)\n", cmd.host)
-			return 1
+	opts := doctor.Options{
+		ConfigPath: cmd.opts.configPath,
+		Host:       cmd.host,
+	}
+
+	cfg, err := config.Load(cmd.opts.configPath)
+	if err == nil {
+		cfg = cloneConfig(cfg)
+		if strings.TrimSpace(cmd.opts.socketPath) != "" {
+			cfg.IPC.SocketPath = cmd.opts.socketPath
+		}
+		opts.Config = cfg
+		opts.ConfigPath = ""
+
+		if a.newLarkClient != nil {
+			larkClient, err := a.newLarkClient(cfg)
+			if err != nil {
+				opts.Lark = failingLarkClient{err: fmt.Errorf("create lark client: %w", err)}
+			} else {
+				opts.Lark = larkClient
+			}
 		}
 	}
 
-	socketPath, err := resolveSocketPathFromConfig(cmd.opts, cfg)
-	if err != nil {
-		fmt.Fprintf(a.stderr, "socket: %v\n", err)
+	report := doctor.Run(ctx, opts)
+	fmt.Fprintln(a.stdout, report.Text())
+	if report.Failed() {
 		return 1
 	}
-	if a.daemonReachable(cmd.opts, socketPath) {
-		fmt.Fprintf(a.stdout, "daemon: running (%s)\n", socketPath)
-	} else {
-		fmt.Fprintf(a.stdout, "daemon: not running (%s)\n", socketPath)
-	}
 	return 0
+}
+
+func cloneConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	out := *cfg
+	if cfg.Hosts != nil {
+		out.Hosts = make(map[string]config.HostConfig, len(cfg.Hosts))
+		for name, host := range cfg.Hosts {
+			out.Hosts[name] = host
+		}
+	}
+	out.Exec.AllowedChatIDs = append([]string(nil), cfg.Exec.AllowedChatIDs...)
+	out.Exec.AllowedSenderOpenIDs = append([]string(nil), cfg.Exec.AllowedSenderOpenIDs...)
+	return &out
+}
+
+type failingLarkClient struct {
+	err error
+}
+
+func (c failingLarkClient) TenantAccessToken(context.Context) (string, error) {
+	return "", c.err
+}
+
+func (c failingLarkClient) BotOpenID(context.Context) (string, error) {
+	return "", c.err
 }
 
 func (a *app) runDaemon(cmd parsedCommand) int {

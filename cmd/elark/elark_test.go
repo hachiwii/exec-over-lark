@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/hachiwii/exec-over-lark/internal/config"
+	"github.com/hachiwii/exec-over-lark/internal/doctor"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
+	"github.com/hachiwii/exec-over-lark/internal/lark"
 )
 
 func TestHostCommandUsesNonPTYByDefault(t *testing.T) {
@@ -182,7 +186,7 @@ func TestDaemonStatusUsesFakeDial(t *testing.T) {
 }
 
 func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	writeCLIConfig(t, dir, "never-print-me")
 	configPath := filepath.Join(dir, "config.toml")
 
@@ -202,16 +206,43 @@ func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 	})
 
 	t.Run("doctor", func(t *testing.T) {
+		startTestUnixSocket(t, filepath.Join(dir, "elarkd.sock"))
+		fakeLark := &fakeDoctorLark{
+			token:         "tenant-token-never-print-me",
+			openID:        "ou_self_bot",
+			chatAvailable: true,
+			rootMessageID: "om_doctor_ping",
+		}
 		app, stdout, stderr := newTestApp(&fakeClient{}, nil)
+		app.newLarkClient = func(*config.Config) (doctor.LarkClient, error) {
+			return fakeLark, nil
+		}
 		code := app.run([]string{"--config", configPath, "doctor", "macmini"})
 		if code != 0 {
 			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 		}
 		combined := stdout.String() + stderr.String()
-		if !strings.Contains(combined, "config: ok") || !strings.Contains(combined, "host: ok") {
-			t.Fatalf("output = %q, want doctor checks", combined)
+		for _, want := range []string{
+			"exec-over-lark doctor macmini",
+			"[ok] config_load",
+			"[ok] host_config",
+			"[ok] daemon_socket",
+			"[ok] token_refresh",
+			"[ok] bot_open_id",
+			"[ok] chat",
+			"[ok] ping_root_message",
+			"[skipped] peer_bot",
+			"[skipped] bootstrap",
+		} {
+			if !strings.Contains(combined, want) {
+				t.Fatalf("output = %q, want %q", combined, want)
+			}
 		}
-		if strings.Contains(combined, "never-print-me") || strings.Contains(combined, "app_secret") {
+		if fakeLark.tokenCalls != 1 || fakeLark.openIDCalls != 1 || fakeLark.chatCalls != 1 || fakeLark.rootCalls != 1 {
+			t.Fatalf("doctor lark calls token/openID/chat/root = %d/%d/%d/%d, want 1/1/1/1",
+				fakeLark.tokenCalls, fakeLark.openIDCalls, fakeLark.chatCalls, fakeLark.rootCalls)
+		}
+		if strings.Contains(combined, "never-print-me") || strings.Contains(combined, "app_secret") || strings.Contains(combined, "tenant-token-never-print-me") {
 			t.Fatalf("doctor leaked secret material: %q", combined)
 		}
 	})
@@ -269,6 +300,14 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 		stderr:      stderr,
 		dial:        dialer.dial,
 		startDaemon: func(context.Context, string, io.Writer, io.Writer) error { return nil },
+		newLarkClient: func(*config.Config) (doctor.LarkClient, error) {
+			return &fakeDoctorLark{
+				token:         "tenant-token",
+				openID:        "ou_self_bot",
+				chatAvailable: true,
+				rootMessageID: "om_doctor_ping",
+			}, nil
+		},
 		getenv: func(key string) string {
 			switch key {
 			case "LINES":
@@ -345,6 +384,78 @@ func (f *fakeClient) Receive(ctx context.Context) (ipc.Message, error) {
 func (f *fakeClient) Close() error {
 	f.closed = true
 	return nil
+}
+
+type fakeDoctorLark struct {
+	token         string
+	openID        string
+	chatAvailable bool
+	rootMessageID string
+
+	tokenCalls  int
+	openIDCalls int
+	chatCalls   int
+	rootCalls   int
+}
+
+func (f *fakeDoctorLark) TenantAccessToken(context.Context) (string, error) {
+	f.tokenCalls++
+	return f.token, nil
+}
+
+func (f *fakeDoctorLark) BotOpenID(context.Context) (string, error) {
+	f.openIDCalls++
+	return f.openID, nil
+}
+
+func (f *fakeDoctorLark) ChatAvailable(context.Context, string) (bool, error) {
+	f.chatCalls++
+	return f.chatAvailable, nil
+}
+
+func (f *fakeDoctorLark) SendRootMessage(context.Context, string, string, string) (lark.RootMessage, error) {
+	f.rootCalls++
+	return lark.RootMessage{MessageID: f.rootMessageID}, nil
+}
+
+func startTestUnixSocket(t *testing.T, path string) {
+	t.Helper()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(path)
+	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+}
+
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "elark-cli-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	return dir
 }
 
 func writeCLIConfig(t *testing.T, dir, secret string) {

@@ -187,6 +187,20 @@ func (c *Client) BotOpenID(ctx context.Context) (string, error) {
 	return openID, nil
 }
 
+func (c *Client) ChatAvailable(ctx context.Context, chatID string) (bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return false, errors.New("chatID is required")
+	}
+
+	var out chatMembershipResponse
+	path := "/open-apis/im/v1/chats/" + url.PathEscape(chatID) + "/members/is_in_chat"
+	if err := c.doAuthorizedJSON(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
+		return false, err
+	}
+	return out.IsInChat, nil
+}
+
 func (c *Client) SendRootMessage(ctx context.Context, chatID, mentionOpenID, text string) (RootMessage, error) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
@@ -580,6 +594,10 @@ type botInfoResponse struct {
 			OpenID string `json:"open_id"`
 		} `json:"bot"`
 	} `json:"data"`
+}
+
+type chatMembershipResponse struct {
+	IsInChat bool `json:"is_in_chat"`
 }
 
 type MessageEvent struct {

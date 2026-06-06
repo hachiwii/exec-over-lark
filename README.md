@@ -246,7 +246,7 @@ elarkd --config ~/.elark/config.toml
 elark hosts
 ```
 
-检查配置、daemon socket、bot、群和 peer bot：
+输出 doctor 报告。当前会检查配置路径、权限、加载和 host 配置，探测 daemon socket，刷新 Lark tenant token，查询本 bot `open_id`。指定 host 时，还会检查本 bot 是否在配置的群里，并发送一条 `doctor ping` root 消息提及 peer bot；peer bot 成员查询和 bootstrap 历史消息查询暂未接入，会在报告里显示 `skipped`：
 
 ```bash
 elark doctor
@@ -361,7 +361,7 @@ go build ./cmd/elarkd
 - `cmd/elarkd`：统一 daemon 入口。
 - `internal/config`：TOML 配置、默认路径、模板生成和权限检查。
 - `internal/ipc`：本地 Unix socket 协议。
-- `internal/lark`：飞书 OpenAPI client、token、bot OpenID 和消息发送。
+- `internal/lark`：飞书 OpenAPI client、token、bot OpenID、bot 入群检查和消息发送。
 - `internal/outbound`：发送队列、限流、聚合和拆分。
 - `internal/protocol`：`EOL1` frame 编解码。
 - `internal/session`：连接、序列窗口、heartbeat 和 session 分发。

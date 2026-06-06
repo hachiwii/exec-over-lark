@@ -340,6 +340,49 @@ func TestPersistentConnectionEndpoint(t *testing.T) {
 	}
 }
 
+func TestChatAvailableChecksSelfBotMembership(t *testing.T) {
+	var tokenRequests int
+	var membershipRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case tenantTokenPath:
+			tokenRequests++
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"tenant_access_token": "token-a",
+				"expire":              3600,
+			})
+		case "/open-apis/im/v1/chats/oc_json/members/is_in_chat":
+			membershipRequests++
+			if r.Method != http.MethodGet {
+				t.Fatalf("method = %s, want GET", r.Method)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer token-a" {
+				t.Fatalf("membership Authorization = %q, want Bearer token-a", got)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"data": map[string]any{"is_in_chat": true},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	ok, err := client.ChatAvailable(context.Background(), "oc_json")
+	if err != nil {
+		t.Fatalf("ChatAvailable returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("ChatAvailable = false, want true")
+	}
+	if tokenRequests != 1 || membershipRequests != 1 {
+		t.Fatalf("token/membership requests = %d/%d, want 1/1", tokenRequests, membershipRequests)
+	}
+}
+
 func TestParseMessageReceiveEvent(t *testing.T) {
 	payload := []byte(`{"pty":true,"heartbeat":{"interval":"10s","timeout":"30s"}}`)
 	framesText, err := protocol.EncodeFrames([]protocol.Frame{
