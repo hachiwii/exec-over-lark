@@ -17,6 +17,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/bootstrap"
 	"github.com/hachiwii/exec-over-lark/internal/daemon"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
+	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	sdkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
 
@@ -251,6 +252,10 @@ func (s *larkWebSocketEventSource) handlePayload(ctx context.Context, payload []
 
 	event, err := lark.ParseMessageReceiveEvent(payload, selfBotOpenID)
 	if errors.Is(err, lark.ErrIgnoredEvent) {
+		return nil
+	}
+	if errors.Is(err, protocol.ErrInvalidFrame) {
+		s.log("ignored malformed protocol event: %v", err)
 		return nil
 	}
 	if err != nil {
