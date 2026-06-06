@@ -448,7 +448,7 @@ func startTestUnixSocket(t *testing.T, path string) {
 
 func shortTempDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "elark-cli-*")
+	dir, err := os.MkdirTemp("/tmp", "elark-command-*")
 	if err != nil {
 		t.Fatal(err)
 	}
