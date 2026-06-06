@@ -34,7 +34,25 @@
 
 ### 从 Release 安装
 
-在 GitHub Releases 下载与你的系统匹配的压缩包，例如：
+推荐使用一键安装脚本。脚本会检测 macOS/Linux 和 CPU 架构，从 GitHub latest release 选择匹配的归档，安装 `elark` 和 `elarkd`，并在结束时输出安装位置、生成初始配置的命令和启动后台进程的命令。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hachiwii/exec-over-lark/main/scripts/install.sh | sh
+```
+
+也可以先下载脚本再执行，或指定安装目录：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hachiwii/exec-over-lark/main/scripts/install.sh -o install.sh
+sh install.sh
+ELARK_INSTALL_DIR="$HOME/.local/bin" sh install.sh
+```
+
+脚本优先安装到已经在 `PATH` 中的 `$HOME/.local/bin`，其次选择已有可写 `PATH` 目录；如果没有可写 `PATH` 目录，会创建 `$HOME/.local/bin` 并提示把它加入 `PATH`。
+
+如果还没有发布 GitHub release，`releases/latest` 会返回 404；先发布一个包含对应系统归档的 release 后再执行脚本。
+
+手动安装时，在 GitHub Releases 下载与你的系统匹配的压缩包，例如：
 
 - `exec-over-lark_vX.Y.Z_darwin_amd64.tar.gz`
 - `exec-over-lark_vX.Y.Z_darwin_arm64.tar.gz`
@@ -45,8 +63,31 @@
 
 ```bash
 tar -xzf exec-over-lark_vX.Y.Z_linux_amd64.tar.gz
-sudo install -m 0755 exec-over-lark_vX.Y.Z_linux_amd64/elark /usr/local/bin/elark
-sudo install -m 0755 exec-over-lark_vX.Y.Z_linux_amd64/elarkd /usr/local/bin/elarkd
+mkdir -p "$HOME/.local/bin"
+cp exec-over-lark_vX.Y.Z_linux_amd64/elark "$HOME/.local/bin/elark"
+cp exec-over-lark_vX.Y.Z_linux_amd64/elarkd "$HOME/.local/bin/elarkd"
+chmod 0755 "$HOME/.local/bin/elark" "$HOME/.local/bin/elarkd"
+```
+
+确认安装：
+
+```bash
+elark --help
+elarkd init --help
+```
+
+生成初始配置并启动本地后台进程：
+
+```bash
+elarkd init --client
+elark daemon start
+```
+
+远端机器通常生成 server 配置并直接运行 `elarkd`：
+
+```bash
+elarkd init --server
+elarkd --config ~/.elark/config.toml
 ```
 
 ### 从源码安装
