@@ -4,8 +4,13 @@
 *.test
 *.out
 
+# Dynamic workflow local files
+*.workflow
+*.workflow.run
+*.workflow.run.lock
+/.local/
+
 # Local editor and OS files
 .DS_Store
 .idea/
 .vscode/
-
