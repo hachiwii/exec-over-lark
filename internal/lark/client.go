@@ -25,6 +25,7 @@ const (
 	tenantTokenPath = "/open-apis/auth/v3/tenant_access_token/internal"
 	botInfoPath     = "/open-apis/bot/v3/info"
 	sendMessagePath = "/open-apis/im/v1/messages"
+	wsEndpointPath  = "/callback/ws/endpoint"
 
 	MessageReceiveEventType = "im.message.receive_v1"
 	MessageTypeText         = "text"
@@ -61,6 +62,18 @@ type Client struct {
 
 type RootMessage struct {
 	MessageID string
+}
+
+type WSEndpoint struct {
+	URL          string
+	ClientConfig WSClientConfig
+}
+
+type WSClientConfig struct {
+	ReconnectCount    int
+	ReconnectInterval time.Duration
+	ReconnectNonce    time.Duration
+	PingInterval      time.Duration
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -113,6 +126,40 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 func (c *Client) TenantAccessToken(ctx context.Context) (string, error) {
 	return c.tenantAccessToken(ctx, false)
+}
+
+func (c *Client) PersistentConnectionEndpoint(ctx context.Context) (WSEndpoint, error) {
+	reqBody := wsEndpointRequest{
+		AppID:     c.appID,
+		AppSecret: c.appSecret,
+	}
+	respBody, status, err := c.doRawJSON(ctx, http.MethodPost, wsEndpointPath, nil, reqBody, "")
+	if err != nil {
+		return WSEndpoint{}, err
+	}
+	if status < 200 || status >= 300 {
+		return WSEndpoint{}, apiErrorFromResponse(wsEndpointPath, status, respBody)
+	}
+
+	var out wsEndpointResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return WSEndpoint{}, fmt.Errorf("decode lark websocket endpoint response: %w", err)
+	}
+	if out.Code != 0 {
+		return WSEndpoint{}, &apiError{Code: out.Code, Msg: out.Msg, Path: wsEndpointPath}
+	}
+	if strings.TrimSpace(out.Data.URL) == "" {
+		return WSEndpoint{}, errors.New("lark websocket endpoint response missing URL")
+	}
+	return WSEndpoint{
+		URL: out.Data.URL,
+		ClientConfig: WSClientConfig{
+			ReconnectCount:    out.Data.ClientConfig.ReconnectCount,
+			ReconnectInterval: secondsDuration(out.Data.ClientConfig.ReconnectInterval),
+			ReconnectNonce:    secondsDuration(out.Data.ClientConfig.ReconnectNonce),
+			PingInterval:      secondsDuration(out.Data.ClientConfig.PingInterval),
+		},
+	}, nil
 }
 
 func (c *Client) BotOpenID(ctx context.Context) (string, error) {
@@ -425,6 +472,25 @@ type tenantTokenResponse struct {
 	Data              struct {
 		TenantAccessToken string `json:"tenant_access_token"`
 		Expire            int    `json:"expire"`
+	} `json:"data"`
+}
+
+type wsEndpointRequest struct {
+	AppID     string `json:"AppID"`
+	AppSecret string `json:"AppSecret"`
+}
+
+type wsEndpointResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		URL          string `json:"URL"`
+		ClientConfig struct {
+			ReconnectCount    int `json:"ReconnectCount"`
+			ReconnectInterval int `json:"ReconnectInterval"`
+			ReconnectNonce    int `json:"ReconnectNonce"`
+			PingInterval      int `json:"PingInterval"`
+		} `json:"ClientConfig"`
 	} `json:"data"`
 }
 
@@ -754,4 +820,11 @@ func firstPositive(values ...int) int {
 		}
 	}
 	return 0
+}
+
+func secondsDuration(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }

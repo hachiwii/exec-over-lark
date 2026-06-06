@@ -75,6 +75,7 @@ type ExecConfig struct {
 type HostConfig struct {
 	ChatID           string `toml:"chat_id"`
 	PeerBotOpenID    string `toml:"peer_bot_open_id"`
+	PeerSenderOpenID string `toml:"peer_sender_open_id"`
 	Shell            string `toml:"shell"`
 	StreamChunkBytes int    `toml:"stream_chunk_bytes"`
 	DefaultCWD       string `toml:"default_cwd"`
@@ -323,6 +324,11 @@ func Validate(cfg *Config) error {
 		}
 		if err := validateLarkID("hosts."+name+".peer_bot_open_id", host.PeerBotOpenID, "ou_"); err != nil {
 			return err
+		}
+		if strings.TrimSpace(host.PeerSenderOpenID) != "" {
+			if err := validateLarkID("hosts."+name+".peer_sender_open_id", host.PeerSenderOpenID, "ou_"); err != nil {
+				return err
+			}
 		}
 		if host.StreamChunkBytes <= 0 {
 			return fmt.Errorf("hosts.%s.stream_chunk_bytes must be greater than zero", name)

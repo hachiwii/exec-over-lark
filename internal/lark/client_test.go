@@ -243,6 +243,59 @@ func TestSendRootMessageIncludesLarkErrorBodyForNon2xx(t *testing.T) {
 	}
 }
 
+func TestPersistentConnectionEndpoint(t *testing.T) {
+	var endpointRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case wsEndpointPath:
+			endpointRequests++
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			var req wsEndpointRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode endpoint request: %v", err)
+			}
+			if req.AppID != "cli_test" || req.AppSecret != "secret_test" {
+				t.Fatalf("endpoint request = %#v", req)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"URL": "wss://msg-frontier.feishu.cn/ws/v2?service_id=123",
+					"ClientConfig": map[string]any{
+						"ReconnectCount":    7,
+						"ReconnectInterval": 11,
+						"ReconnectNonce":    13,
+						"PingInterval":      17,
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	endpoint, err := client.PersistentConnectionEndpoint(context.Background())
+	if err != nil {
+		t.Fatalf("PersistentConnectionEndpoint returned error: %v", err)
+	}
+	if endpoint.URL != "wss://msg-frontier.feishu.cn/ws/v2?service_id=123" {
+		t.Fatalf("URL = %q", endpoint.URL)
+	}
+	if endpoint.ClientConfig.ReconnectCount != 7 ||
+		endpoint.ClientConfig.ReconnectInterval != 11*time.Second ||
+		endpoint.ClientConfig.ReconnectNonce != 13*time.Second ||
+		endpoint.ClientConfig.PingInterval != 17*time.Second {
+		t.Fatalf("ClientConfig = %#v", endpoint.ClientConfig)
+	}
+	if endpointRequests != 1 {
+		t.Fatalf("endpointRequests = %d, want 1", endpointRequests)
+	}
+}
+
 func TestParseMessageReceiveEvent(t *testing.T) {
 	payload := []byte(`{"pty":true,"heartbeat":{"interval":"10s","timeout":"30s"}}`)
 	framesText, err := protocol.EncodeFrames([]protocol.Frame{

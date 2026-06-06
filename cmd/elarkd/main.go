@@ -11,6 +11,7 @@ import (
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/daemon"
+	"github.com/hachiwii/exec-over-lark/internal/lark"
 )
 
 func main() {
@@ -18,6 +19,10 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if os.Getenv(loopbackE2EEnv) == "1" {
+		return runLoopbackE2E(args, stdout, stderr)
+	}
+
 	if len(args) > 0 && args[0] == "init" {
 		return runInit(args[1:], stdout, stderr)
 	}
@@ -33,17 +38,56 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	local, err := daemon.NewLocal(daemon.LocalOptions{ConfigPath: *configPath})
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "elarkd: %v\n", err)
 		return 1
 	}
+	larkClient, err := lark.NewClient(lark.ClientConfig{
+		AppID:     cfg.Lark.AppID,
+		AppSecret: cfg.Lark.AppSecret,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "elarkd: %v\n", err)
+		return 1
+	}
+	eventSource := newLarkWebSocketEventSource(larkClient, stderr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := local.Run(ctx); err != nil {
-		fmt.Fprintf(stderr, "elarkd: %v\n", err)
+	var runErr error
+	if cfg.Exec.Enabled && !cfg.IPC.Enabled {
+		selfOpenID, err := larkClient.BotOpenID(ctx)
+		if err != nil {
+			fmt.Fprintf(stderr, "elarkd: resolve self bot open_id: %v\n", err)
+			return 1
+		}
+		remote, err := daemon.NewRemoteDaemon(daemon.RemoteOptions{
+			Config:        daemon.RemoteConfigFromConfig(cfg),
+			EventSource:   eventSource,
+			SelfBotOpenID: selfOpenID,
+			Sender:        larkClient,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "elarkd: %v\n", err)
+			return 1
+		}
+		runErr = remote.Run(ctx)
+	} else {
+		local, err := daemon.NewLocal(daemon.LocalOptions{
+			Config:      cfg,
+			LarkClient:  larkClient,
+			EventSource: eventSource,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "elarkd: %v\n", err)
+			return 1
+		}
+		runErr = local.Run(ctx)
+	}
+	if runErr != nil {
+		fmt.Fprintf(stderr, "elarkd: %v\n", runErr)
 		return 1
 	}
 	return 0

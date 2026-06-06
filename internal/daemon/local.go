@@ -323,6 +323,8 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 		Cwd:       cwd,
 		Env:       cloneEnv(req.Env),
 		Shell:     shell,
+		Rows:      req.Rows,
+		Cols:      req.Cols,
 		Heartbeat: d.sessions.HeartbeatConfig(),
 	}
 	frame, err := protocol.NewJSONFrame(1, protocol.TypeStart, startPayload)
@@ -349,7 +351,7 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 		ConnID:        connID,
 		RootMessageID: connID,
 		ChatID:        host.ChatID,
-		PeerBotOpenID: host.PeerBotOpenID,
+		PeerBotOpenID: firstLocalNonEmpty(host.PeerSenderOpenID, host.PeerBotOpenID),
 		NextSendSeq:   2,
 	}, subscriber); err != nil {
 		return "", err
@@ -393,7 +395,8 @@ func (d *Local) LocalSessions() []session.Snapshot {
 
 func (d *Local) eventMatchesConfiguredHost(event lark.MessageEvent) bool {
 	for _, host := range d.cfg.Hosts {
-		if event.ChatID == host.ChatID && event.SenderOpenID == host.PeerBotOpenID {
+		peerSender := firstLocalNonEmpty(host.PeerSenderOpenID, host.PeerBotOpenID)
+		if event.ChatID == host.ChatID && event.SenderOpenID == peerSender {
 			return true
 		}
 	}

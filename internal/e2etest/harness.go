@@ -45,6 +45,7 @@ type Options struct {
 	RemoteConfig daemon.RemoteConfig
 
 	RemoteExecutor daemon.RemoteExecutor
+	Mirror         MirrorOptions
 
 	LocalTickInterval  time.Duration
 	LocalFlushInterval time.Duration
@@ -119,6 +120,16 @@ type BootstrapRecord struct {
 	ChatID       string
 	SenderOpenID string
 	Text         string
+}
+
+type MirrorOptions struct {
+	Client MirrorSender
+	Server MirrorSender
+}
+
+type MirrorSender interface {
+	SendRootMessage(ctx context.Context, chatID, mentionOpenID, text string) (lark.RootMessage, error)
+	ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error)
 }
 
 func NewHarness(opts Options) (*Harness, error) {
@@ -199,6 +210,7 @@ func NewHarness(opts Options) (*Harness, error) {
 		ClientBotOpenID: clientOpenID,
 		ServerBotOpenID: serverOpenID,
 		DeliveryDelay:   deliveryDelay,
+		Mirror:          opts.Mirror,
 	})
 
 	h := &Harness{
@@ -506,12 +518,14 @@ type FakeLarkOptions struct {
 	ClientBotOpenID string
 	ServerBotOpenID string
 	DeliveryDelay   time.Duration
+	Mirror          MirrorOptions
 }
 
 type FakeLark struct {
 	clientBotOpenID string
 	serverBotOpenID string
 	deliveryDelay   time.Duration
+	mirror          MirrorOptions
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -538,6 +552,7 @@ func NewFakeLark(opts FakeLarkOptions) *FakeLark {
 		clientBotOpenID:    clientOpenID,
 		serverBotOpenID:    serverOpenID,
 		deliveryDelay:      opts.DeliveryDelay,
+		mirror:             opts.Mirror,
 		ctx:                ctx,
 		cancel:             cancel,
 		deliverCh:          make(chan MessageRecord, 256),
@@ -595,7 +610,15 @@ func (b *FakeLark) BootstrapMessages() []BootstrapRecord {
 }
 
 func (b *FakeLark) sendRoot(ctx context.Context, senderOpenID, chatID, mentionOpenID, text string) (lark.RootMessage, error) {
-	msg := b.newMessage(senderOpenID, chatID, "", mentionOpenID, text)
+	messageID := ""
+	if mirror := b.mirrorFor(senderOpenID); mirror != nil {
+		root, err := mirror.SendRootMessage(ctx, chatID, mentionOpenID, text)
+		if err != nil {
+			return lark.RootMessage{}, err
+		}
+		messageID = strings.TrimSpace(root.MessageID)
+	}
+	msg := b.newMessageWithID(messageID, senderOpenID, chatID, "", mentionOpenID, text)
 	if err := b.enqueue(ctx, msg); err != nil {
 		return lark.RootMessage{}, err
 	}
@@ -603,7 +626,15 @@ func (b *FakeLark) sendRoot(ctx context.Context, senderOpenID, chatID, mentionOp
 }
 
 func (b *FakeLark) sendReply(ctx context.Context, senderOpenID, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
-	msg := b.newMessage(senderOpenID, chatID, rootMessageID, mentionOpenID, text)
+	messageID := ""
+	if mirror := b.mirrorFor(senderOpenID); mirror != nil {
+		id, err := mirror.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
+		if err != nil {
+			return "", err
+		}
+		messageID = strings.TrimSpace(id)
+	}
+	msg := b.newMessageWithID(messageID, senderOpenID, chatID, rootMessageID, mentionOpenID, text)
 	if err := b.enqueue(ctx, msg); err != nil {
 		return "", err
 	}
@@ -620,11 +651,25 @@ func (b *FakeLark) recordBootstrap(senderOpenID, chatID, text string) {
 	})
 }
 
-func (b *FakeLark) newMessage(senderOpenID, chatID, rootMessageID, mentionOpenID, text string) MessageRecord {
+func (b *FakeLark) mirrorFor(senderOpenID string) MirrorSender {
+	switch strings.TrimSpace(senderOpenID) {
+	case b.clientBotOpenID:
+		return b.mirror.Client
+	case b.serverBotOpenID:
+		return b.mirror.Server
+	default:
+		return nil
+	}
+}
+
+func (b *FakeLark) newMessageWithID(messageID, senderOpenID, chatID, rootMessageID, mentionOpenID, text string) MessageRecord {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.nextMessage++
-	messageID := fmt.Sprintf("om_e2e_%06d", b.nextMessage)
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		b.nextMessage++
+		messageID = fmt.Sprintf("om_e2e_%06d", b.nextMessage)
+	}
 	frames, _ := protocol.DecodeFrames(text)
 	msg := MessageRecord{
 		MessageID:     messageID,

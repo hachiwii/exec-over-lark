@@ -66,6 +66,8 @@ type StartPayload struct {
 	Cwd       string            `json:"cwd,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
 	Shell     string            `json:"shell,omitempty"`
+	Rows      int               `json:"rows,omitempty"`
+	Cols      int               `json:"cols,omitempty"`
 	Heartbeat HeartbeatConfig   `json:"heartbeat"`
 }
 

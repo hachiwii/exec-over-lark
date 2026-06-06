@@ -17,6 +17,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/lark"
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
+	"github.com/hachiwii/exec-over-lark/internal/pty"
 	"github.com/hachiwii/exec-over-lark/internal/remoteexec"
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
@@ -24,12 +25,11 @@ import (
 const defaultRemoteEventBuffer = 128
 
 var (
-	ErrRemoteExecDisabled   = errors.New("remote exec is disabled")
-	ErrRemoteMissingStream  = errors.New("remote event stream is nil")
-	ErrRemoteMissingSender  = errors.New("remote sender is nil")
-	ErrRemoteMissingBotID   = errors.New("remote self bot open_id is required")
-	ErrRemoteMissingExec    = errors.New("remote executor is nil")
-	ErrRemoteUnsupportedPTY = errors.New("remote pty execution is not implemented")
+	ErrRemoteExecDisabled  = errors.New("remote exec is disabled")
+	ErrRemoteMissingStream = errors.New("remote event stream is nil")
+	ErrRemoteMissingSender = errors.New("remote sender is nil")
+	ErrRemoteMissingBotID  = errors.New("remote self bot open_id is required")
+	ErrRemoteMissingExec   = errors.New("remote executor is nil")
 )
 
 type RemoteSender interface {
@@ -67,6 +67,7 @@ type RemoteConfig struct {
 type RemoteOptions struct {
 	Config        RemoteConfig
 	EventStream   io.Reader
+	EventSource   EventSource
 	SelfBotOpenID string
 	Sender        RemoteSender
 	Executor      RemoteExecutor
@@ -75,6 +76,7 @@ type RemoteOptions struct {
 type RemoteDaemon struct {
 	cfg           RemoteConfig
 	eventStream   io.Reader
+	eventSource   EventSource
 	selfBotOpenID string
 	sender        RemoteSender
 	executor      RemoteExecutor
@@ -114,7 +116,7 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 	if !cfg.ExecEnabled {
 		return nil, ErrRemoteExecDisabled
 	}
-	if opts.EventStream == nil {
+	if opts.EventStream == nil && opts.EventSource == nil {
 		return nil, ErrRemoteMissingStream
 	}
 	if strings.TrimSpace(opts.SelfBotOpenID) == "" {
@@ -147,6 +149,7 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 	return &RemoteDaemon{
 		cfg:            cfg,
 		eventStream:    opts.EventStream,
+		eventSource:    opts.EventSource,
 		selfBotOpenID:  strings.TrimSpace(opts.SelfBotOpenID),
 		sender:         opts.Sender,
 		executor:       executor,
@@ -183,7 +186,12 @@ func (d *RemoteDaemon) Run(ctx context.Context) error {
 		}
 	}()
 
-	err := d.consumeEventStream(runCtx)
+	var err error
+	if d.eventSource != nil {
+		err = d.eventSource.Run(runCtx, d.selfBotOpenID, d.HandleMessageEvent)
+	} else {
+		err = d.consumeEventStream(runCtx)
+	}
 	if err != nil {
 		cancel()
 	}
@@ -477,17 +485,7 @@ func (t *remoteTask) run(parent context.Context) {
 		_ = t.daemon.manager.SendRemoteError(ctx, t.connID, "remote session start not found", "")
 		return
 	}
-	if start.Pty || strings.TrimSpace(start.Cmd) == "" {
-		_ = t.daemon.manager.SendRemoteError(ctx, t.connID, ErrRemoteUnsupportedPTY.Error(), "")
-		return
-	}
-
-	proc, err := t.daemon.executor.Start(ctx, remoteexec.Request{
-		Command: start.Cmd,
-		Shell:   firstRemoteNonEmpty(start.Shell, t.daemon.cfg.DefaultShell),
-		Cwd:     start.Cwd,
-		Env:     cloneStringMap(start.Env),
-	})
+	proc, ptyMode, err := t.startProcess(ctx, start)
 	if err != nil {
 		t.sendStartError(ctx, err)
 		return
@@ -498,9 +496,12 @@ func (t *remoteTask) run(parent context.Context) {
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 3)
-	wg.Add(2)
+	wg.Add(1)
 	go t.copyOutput(ctx, &wg, errCh, proc.Stdout(), protocol.TypeStdout)
-	go t.copyOutput(ctx, &wg, errCh, proc.Stderr(), protocol.TypeStderr)
+	if !ptyMode {
+		wg.Add(1)
+		go t.copyOutput(ctx, &wg, errCh, proc.Stderr(), protocol.TypeStderr)
+	}
 
 	result, waitErr := proc.Wait()
 	close(done)
@@ -522,6 +523,32 @@ func (t *remoteTask) run(parent context.Context) {
 		}
 	}
 	_ = t.daemon.manager.SendRemoteExit(context.Background(), t.connID, result.ExitCode)
+}
+
+func (t *remoteTask) startProcess(ctx context.Context, start protocol.StartPayload) (RemoteProcess, bool, error) {
+	shell := firstRemoteNonEmpty(start.Shell, t.daemon.cfg.DefaultShell)
+	if start.Pty || strings.TrimSpace(start.Cmd) == "" {
+		session, err := pty.New(shell).Start(ctx, pty.Request{
+			Command: start.Cmd,
+			Shell:   shell,
+			Cwd:     start.Cwd,
+			Env:     cloneStringMap(start.Env),
+			Rows:    start.Rows,
+			Cols:    start.Cols,
+		})
+		if err != nil {
+			return nil, true, err
+		}
+		return ptyProcess{session: session}, true, nil
+	}
+
+	proc, err := t.daemon.executor.Start(ctx, remoteexec.Request{
+		Command: start.Cmd,
+		Shell:   shell,
+		Cwd:     start.Cwd,
+		Env:     cloneStringMap(start.Env),
+	})
+	return proc, false, err
 }
 
 func (t *remoteTask) startPayload() (protocol.StartPayload, bool) {
@@ -554,6 +581,10 @@ func (t *remoteTask) controlLoop(ctx context.Context, cancel context.CancelFunc,
 			case session.RemoteEventSignal:
 				if sig, ok := signalByName(event.Name); ok {
 					_ = proc.Signal(sig)
+				}
+			case session.RemoteEventResize:
+				if resizable, ok := proc.(interface{ Resize(int, int) error }); ok {
+					_ = resizable.Resize(event.Rows, event.Cols)
 				}
 			case session.RemoteEventClose, session.RemoteEventError, session.RemoteEventSequenceGapTimeout, session.RemoteEventPeerTimeout:
 				cancel()
@@ -595,7 +626,7 @@ func (t *remoteTask) copyOutput(ctx context.Context, wg *sync.WaitGroup, errCh c
 		if err == nil {
 			continue
 		}
-		if errors.Is(err, io.EOF) {
+		if remoteOutputEOF(err) {
 			return
 		}
 		if ctx.Err() == nil {
@@ -603,6 +634,14 @@ func (t *remoteTask) copyOutput(ctx context.Context, wg *sync.WaitGroup, errCh c
 		}
 		return
 	}
+}
+
+func remoteOutputEOF(err error) bool {
+	return err == nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 func (t *remoteTask) sendStartError(ctx context.Context, err error) {
@@ -615,7 +654,49 @@ func (t *remoteTask) sendStartError(ctx context.Context, err error) {
 		_ = t.daemon.manager.SendRemoteError(ctx, t.connID, firstRemoteNonEmpty(startErr.Message, "remote command start failed"), detail)
 		return
 	}
+	var ptyErr *pty.StartError
+	if errors.As(err, &ptyErr) {
+		detail := ""
+		if ptyErr.Err != nil {
+			detail = ptyErr.Err.Error()
+		}
+		_ = t.daemon.manager.SendRemoteError(ctx, t.connID, firstRemoteNonEmpty(ptyErr.Message, "remote pty start failed"), detail)
+		return
+	}
 	_ = t.daemon.manager.SendRemoteError(ctx, t.connID, "remote command start failed", err.Error())
+}
+
+type ptyProcess struct {
+	session *pty.Session
+}
+
+func (p ptyProcess) Stdin() io.WriteCloser {
+	return p.session.Stdin()
+}
+
+func (p ptyProcess) Stdout() io.ReadCloser {
+	return p.session.Stdout()
+}
+
+func (p ptyProcess) Stderr() io.ReadCloser {
+	return nil
+}
+
+func (p ptyProcess) Wait() (remoteexec.Result, error) {
+	result, err := p.session.Wait()
+	return remoteexec.Result{ExitCode: result.ExitCode, Canceled: result.Canceled}, err
+}
+
+func (p ptyProcess) Signal(sig os.Signal) error {
+	return p.session.Signal(sig)
+}
+
+func (p ptyProcess) Kill() error {
+	return p.session.Kill()
+}
+
+func (p ptyProcess) Resize(rows, cols int) error {
+	return p.session.Resize(rows, cols)
 }
 
 type remoteexecAdapter struct {
