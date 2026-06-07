@@ -184,11 +184,12 @@ func (q *Queue) FlushReady(ctx context.Context) (bool, error) {
 		q.mu.Unlock()
 		return false, nil
 	}
-	item := q.popFrontLocked()
+	item := q.frontLocked()
+	frames := cloneFrames(item.frames)
 	q.sending = true
 	q.mu.Unlock()
 
-	remaining, err := q.sendOneRequest(ctx, item.target, item.frames)
+	remaining, err := q.sendOneRequest(ctx, item.target, frames)
 	q.mu.Lock()
 	q.sending = false
 	if err != nil {
@@ -197,9 +198,7 @@ func (q *Queue) FlushReady(ctx context.Context) (bool, error) {
 	}
 
 	q.markSentLocked(q.clock.Now())
-	if len(remaining) > 0 {
-		q.enqueueFrontLocked(item.key, item.target, remaining)
-	}
+	q.dropFrontFramesLocked(item.key, len(frames), remaining)
 	q.mu.Unlock()
 	return true, nil
 }
@@ -419,12 +418,36 @@ func (q *Queue) enqueueFrontLocked(key string, target Target, frames []protocol.
 	q.order = append([]string{key}, q.order...)
 }
 
+func (q *Queue) frontLocked() *pendingTarget {
+	return q.pending[q.order[0]]
+}
+
 func (q *Queue) popFrontLocked() *pendingTarget {
 	key := q.order[0]
 	q.order = q.order[1:]
 	item := q.pending[key]
 	delete(q.pending, key)
 	return item
+}
+
+func (q *Queue) dropFrontFramesLocked(key string, sentLen int, remaining []protocol.Frame) {
+	item, ok := q.pending[key]
+	if !ok {
+		return
+	}
+	if sentLen > len(item.frames) {
+		sentLen = len(item.frames)
+	}
+	tail := cloneFrames(item.frames[sentLen:])
+	next := make([]protocol.Frame, 0, len(remaining)+len(tail))
+	next = append(next, cloneFrames(remaining)...)
+	next = append(next, tail...)
+	if len(next) == 0 {
+		q.popFrontLocked()
+		return
+	}
+	item.frames = next
+	q.moveKeyToFrontLocked(key)
 }
 
 func (q *Queue) moveKeyToFrontLocked(key string) {

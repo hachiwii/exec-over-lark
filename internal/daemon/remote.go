@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -22,7 +23,12 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
 
-const defaultRemoteEventBuffer = 128
+const (
+	defaultRemoteEventBuffer    = 128
+	defaultRemoteFlushInterval  = 100 * time.Millisecond
+	remoteFlushRetryInitialWait = 100 * time.Millisecond
+	remoteFlushRetryMaxWait     = 800 * time.Millisecond
+)
 
 var (
 	ErrRemoteExecDisabled  = errors.New("remote exec is disabled")
@@ -71,6 +77,7 @@ type RemoteOptions struct {
 	SelfBotOpenID string
 	Sender        RemoteSender
 	Executor      RemoteExecutor
+	Logger        *slog.Logger
 }
 
 type RemoteDaemon struct {
@@ -80,6 +87,7 @@ type RemoteDaemon struct {
 	selfBotOpenID string
 	sender        RemoteSender
 	executor      RemoteExecutor
+	logger        *slog.Logger
 
 	queue   *outbound.Queue
 	manager *session.Manager
@@ -125,6 +133,10 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 	if opts.Sender == nil {
 		return nil, ErrRemoteMissingSender
 	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	executor := opts.Executor
 	if executor == nil {
 		if strings.TrimSpace(cfg.DefaultShell) == "" {
@@ -153,6 +165,7 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 		selfBotOpenID:  strings.TrimSpace(opts.SelfBotOpenID),
 		sender:         opts.Sender,
 		executor:       executor,
+		logger:         logger,
 		queue:          queue,
 		manager:        manager,
 		allowedChats:   stringSet(cfg.AllowedChatIDs),
@@ -341,19 +354,29 @@ func (d *RemoteDaemon) unregisterTask(connID string) {
 }
 
 func (d *RemoteDaemon) flushLoop(ctx context.Context) error {
-	timer := time.NewTimer(100 * time.Millisecond)
+	timer := time.NewTimer(defaultRemoteFlushInterval)
 	defer timer.Stop()
+	retryWait := time.Duration(0)
 
 	for {
 		flushed, err := d.queue.FlushReady(ctx)
 		if err != nil {
-			return err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			retryWait = nextRemoteFlushRetryWait(retryWait)
+			d.logger.Warn("remote outbound flush failed; retrying", "error", err, "retry_in", retryWait)
+			if err := waitRemoteFlush(ctx, timer, retryWait); err != nil {
+				return err
+			}
+			continue
 		}
 		if flushed {
+			retryWait = 0
 			continue
 		}
 
-		wait := 100 * time.Millisecond
+		wait := defaultRemoteFlushInterval
 		if next, ok := d.queue.NextFlushAt(); ok {
 			wait = time.Until(next)
 			if wait < 0 {
@@ -361,21 +384,42 @@ func (d *RemoteDaemon) flushLoop(ctx context.Context) error {
 			}
 		}
 		if wait <= 0 {
-			wait = 100 * time.Millisecond
+			wait = defaultRemoteFlushInterval
 		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
+		if err := waitRemoteFlush(ctx, timer, wait); err != nil {
+			return err
 		}
-		timer.Reset(wait)
+	}
+}
 
+func nextRemoteFlushRetryWait(previous time.Duration) time.Duration {
+	if previous <= 0 {
+		return remoteFlushRetryInitialWait
+	}
+	next := previous * 2
+	if next > remoteFlushRetryMaxWait {
+		return remoteFlushRetryMaxWait
+	}
+	return next
+}
+
+func waitRemoteFlush(ctx context.Context, timer *time.Timer, wait time.Duration) error {
+	if wait < 0 {
+		wait = 0
+	}
+	if !timer.Stop() {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
 		case <-timer.C:
+		default:
 		}
+	}
+	timer.Reset(wait)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

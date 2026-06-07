@@ -300,6 +300,47 @@ func TestQueueReturnsSenderFailure(t *testing.T) {
 	}
 }
 
+func TestQueueKeepsPendingFramesWhenFlushSendFails(t *testing.T) {
+	clock := newFakeClock()
+	sender := &fakeSender{}
+	queue := New(sender, WithClock(clock), WithSendCooldown(time.Second))
+	target := testTarget("om_root")
+
+	if err := queue.Enqueue(context.Background(), target, protocol.Frame{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("first")}); err != nil {
+		t.Fatalf("prime Enqueue returned error: %v", err)
+	}
+	if err := queue.Enqueue(context.Background(), target, protocol.Frame{Seq: 2, Type: protocol.TypeStdout, Payload: []byte("retry me")}); err != nil {
+		t.Fatalf("queued Enqueue returned error: %v", err)
+	}
+	clock.Advance(time.Second)
+
+	wantErr := errors.New("lark unavailable")
+	sender.err = wantErr
+	flushed, err := queue.FlushReady(context.Background())
+	if !flushed {
+		t.Fatal("FlushReady did not attempt pending frame")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("FlushReady error = %v, want %v", err, wantErr)
+	}
+	if got := queue.PendingLen(); got != 1 {
+		t.Fatalf("PendingLen after failed flush = %d, want 1", got)
+	}
+
+	sender.err = nil
+	flushed, err = queue.FlushReady(context.Background())
+	if err != nil {
+		t.Fatalf("retry FlushReady returned error: %v", err)
+	}
+	if !flushed {
+		t.Fatal("retry FlushReady did not flush")
+	}
+	if got := queue.PendingLen(); got != 0 {
+		t.Fatalf("PendingLen after retry = %d, want 0", got)
+	}
+	assertMessageFrameSeqs(t, sender.messages[len(sender.messages)-1], 2)
+}
+
 func TestQueueCapsSendAttempts(t *testing.T) {
 	clock := newFakeClock()
 	wantErr := errors.New("still down")
