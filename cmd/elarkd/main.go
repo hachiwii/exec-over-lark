@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -29,8 +30,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	fs := flag.NewFlagSet("elarkd", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		printUsage(fs.Output())
+	}
 	configPath := fs.String("config", "", "path to config file")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	if fs.NArg() != 0 {
@@ -97,11 +104,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 func runInit(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("elarkd init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		printInitUsage(fs.Output())
+	}
 	client := fs.Bool("client", false, "write a client-side template")
 	server := fs.Bool("server", false, "write a server-side template")
 	configPath := fs.String("config", "", "path to config file")
 	force := fs.Bool("force", false, "overwrite an existing config file")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	if fs.NArg() != 0 {
@@ -124,4 +137,29 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "wrote %s\n", path)
 	return 0
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, `Usage:
+  elarkd [--config PATH]
+  elarkd init (--client|--server) [--config PATH] [--force]
+
+Commands:
+  init    write a client or server config template
+
+Options:
+  -config PATH  path to config file
+`)
+}
+
+func printInitUsage(w io.Writer) {
+	fmt.Fprint(w, `Usage:
+  elarkd init (--client|--server) [--config PATH] [--force]
+
+Options:
+  -client       write a client-side template
+  -server       write a server-side template
+  -config PATH  path to config file
+  -force        overwrite an existing config file
+`)
 }
