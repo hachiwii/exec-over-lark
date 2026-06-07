@@ -238,6 +238,30 @@ func (q *Queue) PendingTargets() []Target {
 	return targets
 }
 
+func (q *Queue) FrontTarget() (Target, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.order) == 0 {
+		return Target{}, false
+	}
+	return q.pending[q.order[0]].target, true
+}
+
+func (q *Queue) DropFrontTarget() (Target, int, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.sending || len(q.order) == 0 {
+		return Target{}, 0, false
+	}
+	key := q.order[0]
+	item := q.pending[key]
+	q.order = q.order[1:]
+	delete(q.pending, key)
+	return item.target, len(item.frames), true
+}
+
 func (q *Queue) LastSentAt() (time.Time, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

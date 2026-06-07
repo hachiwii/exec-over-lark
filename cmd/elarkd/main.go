@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
@@ -56,13 +58,43 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var runErr error
-	if cfg.Exec.Enabled && !cfg.IPC.Enabled {
-		selfOpenID, err := larkClient.BotOpenID(ctx)
+	if !cfg.IPC.Enabled && !cfg.Exec.Enabled {
+		fmt.Fprintln(stderr, "elarkd: enable at least one of ipc.enabled or exec.enabled")
+		return 1
+	}
+	selfOpenID, err := larkClient.BotOpenID(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "elarkd: resolve self bot open_id: %v\n", err)
+		return 1
+	}
+
+	handlers := make([]namedEventHandler, 0, 2)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, 3)
+	var wg sync.WaitGroup
+
+	if cfg.IPC.Enabled {
+		local, err := daemon.NewLocal(daemon.LocalOptions{
+			Config:      cfg,
+			LarkClient:  larkClient,
+			EventSource: daemon.NoopEventSource{},
+		})
 		if err != nil {
-			fmt.Fprintf(stderr, "elarkd: resolve self bot open_id: %v\n", err)
+			fmt.Fprintf(stderr, "elarkd: %v\n", err)
 			return 1
 		}
+		handlers = append(handlers, namedEventHandler{name: "local", handler: local.HandleLarkEvent})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := local.RunServices(runCtx, selfOpenID); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	if cfg.Exec.Enabled {
 		eventSource.bootstrapSender = larkClient
 		remote, err := daemon.NewRemoteDaemon(daemon.RemoteOptions{
 			Config:        daemon.RemoteConfigFromConfig(cfg),
@@ -74,24 +106,74 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "elarkd: %v\n", err)
 			return 1
 		}
-		runErr = remote.Run(ctx)
-	} else {
-		local, err := daemon.NewLocal(daemon.LocalOptions{
-			Config:      cfg,
-			LarkClient:  larkClient,
-			EventSource: eventSource,
-		})
-		if err != nil {
-			fmt.Fprintf(stderr, "elarkd: %v\n", err)
-			return 1
-		}
-		runErr = local.Run(ctx)
+		handlers = append(handlers, namedEventHandler{name: "remote", handler: remote.HandleMessageEvent})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := remote.RunServices(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
+				errCh <- err
+			}
+		}()
 	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handler := combinedEventHandler(stderr, handlers...)
+		if err := eventSource.Run(runCtx, selfOpenID, handler); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
+			errCh <- err
+		}
+	}()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		runErr = ctx.Err()
+	case runErr = <-errCh:
+	}
+	cancel()
+	wg.Wait()
 	if runErr != nil {
+		if errors.Is(runErr, context.Canceled) {
+			return 0
+		}
 		fmt.Fprintf(stderr, "elarkd: %v\n", runErr)
 		return 1
 	}
 	return 0
+}
+
+type namedEventHandler struct {
+	name    string
+	handler daemon.EventHandler
+}
+
+func combinedEventHandler(stderr io.Writer, handlers ...namedEventHandler) daemon.EventHandler {
+	return func(ctx context.Context, event lark.MessageEvent) error {
+		handled := false
+		for _, h := range handlers {
+			if h.handler == nil {
+				continue
+			}
+			err := h.handler(ctx, event)
+			if err == nil {
+				handled = true
+				continue
+			}
+			if errors.Is(err, lark.ErrIgnoredEvent) || errors.Is(err, daemon.ErrIgnoredEvent) {
+				continue
+			}
+			handled = true
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			fmt.Fprintf(stderr, "elarkd: ignored %s event handler error: event_id=%s chat_id=%s root_message_id=%s message_id=%s error=%v\n", h.name, event.EventID, event.ChatID, event.RootMessageID, event.MessageID, err)
+		}
+		if !handled {
+			return daemon.ErrIgnoredEvent
+		}
+		return nil
+	}
 }
 
 func runInit(args []string, stdout, stderr io.Writer) int {

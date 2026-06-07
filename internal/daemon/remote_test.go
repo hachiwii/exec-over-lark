@@ -19,6 +19,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/hachiwii/exec-over-lark/internal/remoteexec"
+	"github.com/hachiwii/exec-over-lark/internal/session"
 )
 
 func TestRemoteRunConsumesStartExecutesAndRepliesFrames(t *testing.T) {
@@ -249,6 +250,69 @@ func TestRemoteFlushLoopRetriesAfterSendFailure(t *testing.T) {
 	}
 }
 
+func TestRemoteFlushLoopDropsConnectionAfterRepeatedSendFailures(t *testing.T) {
+	wantErr := errors.New("lark unavailable")
+	sender := &retryRemoteSender{calls: make(chan error, outboundFlushMaxFailures+1)}
+	queue := outbound.New(
+		replyOnlyOutboundSender{sender: sender},
+		outbound.WithSendCooldown(time.Millisecond),
+	)
+	manager := session.New(session.WithOutboundQueue(queue))
+	receiver := &closeTrackingRemoteReceiver{}
+	start := jsonFrame(t, 1, protocol.TypeStart, protocol.StartPayload{Cmd: "sleep 60"})
+	if _, err := manager.AcceptRemoteStart(context.Background(), session.InboundMessage{
+		ConnID:        "om_root",
+		RootMessageID: "om_root",
+		MessageID:     "om_root",
+		ChatID:        "oc_chat",
+		SenderOpenID:  "ou_client",
+		IsRoot:        true,
+		Frames:        []protocol.Frame{start},
+	}, receiver); err != nil {
+		t.Fatalf("AcceptRemoteStart returned error: %v", err)
+	}
+	if err := waitRetrySenderCall(sender.calls); err != nil {
+		t.Fatalf("start ack send returned error: %v", err)
+	}
+	if err := manager.SendRemoteStdout(context.Background(), "om_root", []byte("queued output")); err != nil {
+		t.Fatalf("SendRemoteStdout returned error: %v", err)
+	}
+	if got := queue.PendingLen(); got != 1 {
+		t.Fatalf("PendingLen before flushLoop = %d, want 1", got)
+	}
+
+	sender.setErrors(wantErr, wantErr, wantErr)
+	remote := &RemoteDaemon{
+		queue:   queue,
+		manager: manager,
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- remote.flushLoop(ctx)
+	}()
+
+	for i := 0; i < outboundFlushMaxFailures; i++ {
+		if err := waitRetrySenderCall(sender.calls); !errors.Is(err, wantErr) {
+			t.Fatalf("flush call %d error = %v, want %v", i+1, err, wantErr)
+		}
+	}
+	waitRemoteSessionsLen(t, manager, 0)
+	if !receiver.closed {
+		t.Fatal("remote receiver was not closed")
+	}
+	if got := queue.PendingLen(); got != 0 {
+		t.Fatalf("PendingLen after drop = %d, want 0", got)
+	}
+
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("flushLoop exit error = %v, want context.Canceled", err)
+	}
+}
+
 func newTestRemote(t *testing.T, stream io.Reader, sender *fakeLarkClient, executor *fakeRemoteExecutor, cfg RemoteConfig) *RemoteDaemon {
 	t.Helper()
 	if cfg.LarkTextRequestLimitBytes == 0 {
@@ -411,6 +475,19 @@ type retryRemoteSender struct {
 	calls   chan error
 }
 
+type closeTrackingRemoteReceiver struct {
+	closed bool
+}
+
+func (r *closeTrackingRemoteReceiver) Deliver(context.Context, session.RemoteEvent) error {
+	return nil
+}
+
+func (r *closeTrackingRemoteReceiver) Close() error {
+	r.closed = true
+	return nil
+}
+
 func (s *retryRemoteSender) ReplyRootMessage(_ context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
 	s.mu.Lock()
 	s.replies = append(s.replies, sentMessage{
@@ -463,6 +540,24 @@ func waitQueuePendingLen(t *testing.T, queue *outbound.Queue, want int) {
 		select {
 		case <-deadline:
 			t.Fatalf("PendingLen did not become %d, got %d", want, queue.PendingLen())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitRemoteSessionsLen(t *testing.T, manager *session.Manager, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if got := len(manager.RemoteSessions()); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("RemoteSessions did not become %d, got %d", want, len(manager.RemoteSessions()))
 		case <-ticker.C:
 		}
 	}

@@ -190,7 +190,21 @@ func (d *Local) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("resolve self bot open_id: %w", err)
 	}
+	return d.run(ctx, selfOpenID, true)
+}
 
+func (d *Local) RunServices(ctx context.Context, selfOpenID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	selfOpenID = strings.TrimSpace(selfOpenID)
+	if selfOpenID == "" {
+		return errors.New("local self bot open_id is required")
+	}
+	return d.run(ctx, selfOpenID, false)
+}
+
+func (d *Local) run(ctx context.Context, selfOpenID string, runEventSource bool) error {
 	d.mu.Lock()
 	if d.started {
 		d.mu.Unlock()
@@ -234,13 +248,15 @@ func (d *Local) Run(ctx context.Context) error {
 		}()
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := d.eventSource.Run(runCtx, selfOpenID, d.HandleLarkEvent); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
-			errCh <- err
-		}
-	}()
+	if runEventSource {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := d.eventSource.Run(runCtx, selfOpenID, d.HandleLarkEvent); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	wg.Add(1)
 	go func() {
@@ -406,13 +422,33 @@ func (d *Local) eventMatchesConfiguredHost(event lark.MessageEvent) bool {
 func (d *Local) flushLoop(ctx context.Context) error {
 	timer := time.NewTimer(d.flushInterval)
 	defer timer.Stop()
+	failures := newFlushFailureTracker()
+	retryWait := time.Duration(0)
 
 	for {
+		target, hasTarget := d.queue.FrontTarget()
 		flushed, err := d.queue.FlushReady(ctx)
 		if err != nil {
-			return err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if hasTarget && failures.record(target) >= outboundFlushMaxFailures {
+				d.dropFailedLocalTarget(err, failures)
+				retryWait = 0
+				continue
+			}
+			retryWait = nextOutboundFlushRetryWait(retryWait)
+			d.logger.Warn("local outbound flush failed; retrying", "error", err, "retry_in", retryWait)
+			if err := waitFlushRetry(ctx, timer, retryWait); err != nil {
+				return err
+			}
+			continue
 		}
 		if flushed {
+			if hasTarget {
+				failures.reset(target)
+			}
+			retryWait = 0
 			continue
 		}
 
@@ -426,20 +462,29 @@ func (d *Local) flushLoop(ctx context.Context) error {
 		if wait <= 0 {
 			wait = d.flushInterval
 		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(wait)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+		if err := waitFlushRetry(ctx, timer, wait); err != nil {
+			return err
 		}
 	}
+}
+
+func (d *Local) dropFailedLocalTarget(cause error, failures *flushFailureTracker) {
+	dropped, frameCount, ok := d.queue.DropFrontTarget()
+	if !ok {
+		return
+	}
+	failures.reset(dropped)
+	if strings.TrimSpace(dropped.RootMessageID) != "" {
+		d.sessions.CloseLocalConn(dropped.RootMessageID)
+	}
+	d.logger.Warn(
+		"local outbound flush failed too many times; dropped connection",
+		"chat_id", dropped.ChatID,
+		"root_message_id", dropped.RootMessageID,
+		"mention_open_id", dropped.MentionOpenID,
+		"frames", frameCount,
+		"error", cause,
+	)
 }
 
 func (d *Local) tickLoop(ctx context.Context) error {

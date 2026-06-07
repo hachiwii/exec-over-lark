@@ -341,6 +341,46 @@ func TestQueueKeepsPendingFramesWhenFlushSendFails(t *testing.T) {
 	assertMessageFrameSeqs(t, sender.messages[len(sender.messages)-1], 2)
 }
 
+func TestQueueDropFrontTargetRemovesOnlyFrontPendingFrames(t *testing.T) {
+	clock := newFakeClock()
+	sender := &fakeSender{}
+	queue := New(sender, WithClock(clock), WithSendCooldown(time.Second))
+	first := testTarget("om_first")
+	second := testTarget("om_second")
+
+	if err := queue.Enqueue(context.Background(), first, protocol.Frame{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("prime")}); err != nil {
+		t.Fatalf("prime Enqueue returned error: %v", err)
+	}
+	if err := queue.Enqueue(context.Background(), first, protocol.Frame{Seq: 2, Type: protocol.TypeStdout, Payload: []byte("first queued")}); err != nil {
+		t.Fatalf("first queued Enqueue returned error: %v", err)
+	}
+	if err := queue.Enqueue(context.Background(), second, protocol.Frame{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("second queued")}); err != nil {
+		t.Fatalf("second queued Enqueue returned error: %v", err)
+	}
+
+	front, ok := queue.FrontTarget()
+	if !ok {
+		t.Fatal("FrontTarget returned false")
+	}
+	if !reflect.DeepEqual(front, first) {
+		t.Fatalf("FrontTarget = %#v, want %#v", front, first)
+	}
+	dropped, frameCount, ok := queue.DropFrontTarget()
+	if !ok {
+		t.Fatal("DropFrontTarget returned false")
+	}
+	if !reflect.DeepEqual(dropped, first) || frameCount != 1 {
+		t.Fatalf("dropped = %#v/%d, want first/1", dropped, frameCount)
+	}
+	if got := queue.PendingLen(); got != 1 {
+		t.Fatalf("PendingLen after drop = %d, want 1", got)
+	}
+	front, ok = queue.FrontTarget()
+	if !ok || !reflect.DeepEqual(front, second) {
+		t.Fatalf("FrontTarget after drop = %#v/%v, want second/true", front, ok)
+	}
+}
+
 func TestQueueCapsSendAttempts(t *testing.T) {
 	clock := newFakeClock()
 	wantErr := errors.New("still down")

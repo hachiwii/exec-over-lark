@@ -152,7 +152,7 @@ func (s *larkWebSocketEventSource) runConnection(ctx context.Context, endpoint l
 
 		var frame sdkws.Frame
 		if err := frame.Unmarshal(raw); err != nil {
-			return fmt.Errorf("decode lark websocket frame: %w", err)
+			return wsReconnectError{err: fmt.Errorf("decode lark websocket frame: %w", err)}
 		}
 		if err := s.handleFrame(ctx, conn, &writeMu, chunks, &frame, selfBotOpenID, handler); err != nil {
 			return err
@@ -246,7 +246,11 @@ func (s *larkWebSocketEventSource) handlePayload(ctx context.Context, payload []
 			return nil
 		}
 		if !errors.Is(err, bootstrap.ErrIgnoredEvent) {
-			return err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			s.log("ignored bootstrap event error: %v", err)
+			return nil
 		}
 	}
 
@@ -259,10 +263,15 @@ func (s *larkWebSocketEventSource) handlePayload(ctx context.Context, payload []
 		return nil
 	}
 	if err != nil {
-		return err
+		s.log("ignored malformed lark event: %v", err)
+		return nil
 	}
 	if err := handler(ctx, event); err != nil && !errors.Is(err, lark.ErrIgnoredEvent) && !errors.Is(err, daemon.ErrIgnoredEvent) {
-		return err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		s.log("ignored daemon handler error: event_id=%s chat_id=%s root_message_id=%s message_id=%s error=%v", event.EventID, event.ChatID, event.RootMessageID, event.MessageID, err)
+		return nil
 	}
 	return nil
 }

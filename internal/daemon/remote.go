@@ -24,10 +24,8 @@ import (
 )
 
 const (
-	defaultRemoteEventBuffer    = 128
-	defaultRemoteFlushInterval  = 100 * time.Millisecond
-	remoteFlushRetryInitialWait = 100 * time.Millisecond
-	remoteFlushRetryMaxWait     = 800 * time.Millisecond
+	defaultRemoteEventBuffer   = 128
+	defaultRemoteFlushInterval = 100 * time.Millisecond
 )
 
 var (
@@ -175,6 +173,14 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 }
 
 func (d *RemoteDaemon) Run(ctx context.Context) error {
+	return d.run(ctx, true)
+}
+
+func (d *RemoteDaemon) RunServices(ctx context.Context) error {
+	return d.run(ctx, false)
+}
+
+func (d *RemoteDaemon) run(ctx context.Context, runEventSource bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -200,10 +206,18 @@ func (d *RemoteDaemon) Run(ctx context.Context) error {
 	}()
 
 	var err error
-	if d.eventSource != nil {
-		err = d.eventSource.Run(runCtx, d.selfBotOpenID, d.HandleMessageEvent)
+	if runEventSource {
+		if d.eventSource != nil {
+			err = d.eventSource.Run(runCtx, d.selfBotOpenID, d.HandleMessageEvent)
+		} else {
+			err = d.consumeEventStream(runCtx)
+		}
 	} else {
-		err = d.consumeEventStream(runCtx)
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case err = <-errCh:
+		}
 	}
 	if err != nil {
 		cancel()
@@ -356,22 +370,32 @@ func (d *RemoteDaemon) unregisterTask(connID string) {
 func (d *RemoteDaemon) flushLoop(ctx context.Context) error {
 	timer := time.NewTimer(defaultRemoteFlushInterval)
 	defer timer.Stop()
+	failures := newFlushFailureTracker()
 	retryWait := time.Duration(0)
 
 	for {
+		target, hasTarget := d.queue.FrontTarget()
 		flushed, err := d.queue.FlushReady(ctx)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			retryWait = nextRemoteFlushRetryWait(retryWait)
+			if hasTarget && failures.record(target) >= outboundFlushMaxFailures {
+				d.dropFailedRemoteTarget(err, failures)
+				retryWait = 0
+				continue
+			}
+			retryWait = nextOutboundFlushRetryWait(retryWait)
 			d.logger.Warn("remote outbound flush failed; retrying", "error", err, "retry_in", retryWait)
-			if err := waitRemoteFlush(ctx, timer, retryWait); err != nil {
+			if err := waitFlushRetry(ctx, timer, retryWait); err != nil {
 				return err
 			}
 			continue
 		}
 		if flushed {
+			if hasTarget {
+				failures.reset(target)
+			}
 			retryWait = 0
 			continue
 		}
@@ -386,41 +410,29 @@ func (d *RemoteDaemon) flushLoop(ctx context.Context) error {
 		if wait <= 0 {
 			wait = defaultRemoteFlushInterval
 		}
-		if err := waitRemoteFlush(ctx, timer, wait); err != nil {
+		if err := waitFlushRetry(ctx, timer, wait); err != nil {
 			return err
 		}
 	}
 }
 
-func nextRemoteFlushRetryWait(previous time.Duration) time.Duration {
-	if previous <= 0 {
-		return remoteFlushRetryInitialWait
+func (d *RemoteDaemon) dropFailedRemoteTarget(cause error, failures *flushFailureTracker) {
+	dropped, frameCount, ok := d.queue.DropFrontTarget()
+	if !ok {
+		return
 	}
-	next := previous * 2
-	if next > remoteFlushRetryMaxWait {
-		return remoteFlushRetryMaxWait
+	failures.reset(dropped)
+	if strings.TrimSpace(dropped.RootMessageID) != "" {
+		d.manager.CloseRemoteConn(dropped.RootMessageID)
 	}
-	return next
-}
-
-func waitRemoteFlush(ctx context.Context, timer *time.Timer, wait time.Duration) error {
-	if wait < 0 {
-		wait = 0
-	}
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-	timer.Reset(wait)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	d.logger.Warn(
+		"remote outbound flush failed too many times; dropped connection",
+		"chat_id", dropped.ChatID,
+		"root_message_id", dropped.RootMessageID,
+		"mention_open_id", dropped.MentionOpenID,
+		"frames", frameCount,
+		"error", cause,
+	)
 }
 
 func (d *RemoteDaemon) tickLoop(ctx context.Context) error {

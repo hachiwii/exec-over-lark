@@ -156,7 +156,7 @@ stream_chunk_bytes = 12000
 
 - `node_name`：当前节点名，用于诊断输出。
 - `default_host`：默认 host 名称。
-- `ipc.enabled = true`：允许 `elark` CLI 通过本地 Unix socket 调用本地 daemon。
+- `ipc.enabled = true`：启动本地 client 服务，允许 `elark` CLI 通过本地 Unix socket 调用本地 daemon。
 - `ipc.socket_path`：本地 daemon socket 路径，所在目录权限不能宽于 `0700`。
 - `lark.app_id` / `lark.app_secret`：client bot 的凭据。
 - `lark.send_cooldown`：两次飞书发送之间的最小间隔，默认 `"1000ms"`。
@@ -164,7 +164,7 @@ stream_chunk_bytes = 12000
 - `connection.heartbeat_interval`：连接空闲多久后发送 heartbeat，默认 `"10s"`。
 - `connection.heartbeat_timeout`：声明给对端的超时时间，默认 `"30s"`。
 - `connection.sequence_gap_timeout`：收到跳号 frame 后等待缺失序号的最长时间，默认 `"30s"`。
-- `exec.enabled = false`：本地侧不接受飞书消息触发本机命令执行。
+- `exec.enabled = false`：不启动远端 server 执行服务，因此不会接受飞书消息触发本机命令执行。
 - `hosts.<name>.chat_id`：该 host 使用的话题群 ID。
 - `hosts.<name>.peer_bot_open_id`：该 host 的 server bot OpenID，本地只处理它发出的返回消息。
 - `hosts.<name>.shell`：远端默认 shell。
@@ -204,14 +204,16 @@ stream_chunk_bytes = 12000
 
 远端侧字段说明：
 
-- `ipc.enabled = false`：远端通常不暴露本地 CLI socket。
+- `ipc.enabled = false`：不启动本地 client 服务，因此远端只作为 server 执行命令；如果设为 `true`，同一个 daemon 会同时启动 client 和 server 两侧。
 - `lark.app_id` / `lark.app_secret`：server bot 的凭据。
-- `exec.enabled = true`：允许飞书消息触发远端命令执行。
+- `exec.enabled = true`：启动远端 server 执行服务，允许飞书消息触发本机命令执行。
 - `exec.default_shell`：非交互命令使用的默认 shell。
 - `exec.max_sessions`：远端同时执行的 session 上限，默认 `8`。
 - `exec.stream_chunk_bytes`：远端 stdout/stderr 切片大小，默认 `12000`。
 - `exec.allowed_chat_ids`：可选 chat 白名单。不配置表示允许所有 chat。
 - `exec.allowed_sender_open_ids`：可选发送方 OpenID 白名单。不配置表示允许所有 sender。
+
+`ipc.enabled` 和 `exec.enabled` 是两个独立开关：只开 `ipc.enabled` 是 client-only daemon，只开 `exec.enabled` 是 server-only daemon，两个都开时 daemon 会同时运行 client 和 server 模式，并共享同一个飞书 websocket。共享 websocket 意味着这一份配置只能对应一个 bot 身份；如果 client 和 server 使用两个不同 bot app，仍需要分别启动两个 daemon。
 
 所有时间字段都使用字符串，支持 `ms`、`s`、`m`、`h`、`d`，例如 `"1000ms"`、`"10s"`、`"5m"`、`"1h"`。
 

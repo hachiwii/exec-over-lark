@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"reflect"
 	"sync"
 	"testing"
@@ -11,6 +13,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
+	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
@@ -220,6 +223,73 @@ func TestHandleLarkEventIgnoresUnconfiguredPeer(t *testing.T) {
 	}
 }
 
+func TestLocalFlushLoopDropsConnectionAfterRepeatedSendFailures(t *testing.T) {
+	wantErr := errors.New("lark unavailable")
+	sender := &retryOutboundSender{calls: make(chan error, outboundFlushMaxFailures+1)}
+	queue := outbound.New(sender, outbound.WithSendCooldown(time.Millisecond))
+	manager := session.New(session.WithOutboundQueue(queue))
+	sub := &fakeSubscriber{}
+	if err := manager.RegisterLocal(session.LocalStart{
+		RequestID:     "req-1",
+		ConnID:        "om_root",
+		RootMessageID: "om_root",
+		ChatID:        "oc_chat",
+		PeerBotOpenID: "ou_peer_bot",
+		NextSendSeq:   1,
+	}, sub); err != nil {
+		t.Fatalf("RegisterLocal returned error: %v", err)
+	}
+	target := outbound.Target{
+		ChatID:        "oc_chat",
+		RootMessageID: "om_root",
+		MentionOpenID: "ou_peer_bot",
+	}
+	if err := queue.Enqueue(context.Background(), target, protocol.Frame{Seq: 1, Type: protocol.TypeStdin, Payload: []byte("prime")}); err != nil {
+		t.Fatalf("prime Enqueue returned error: %v", err)
+	}
+	if err := waitRetryOutboundSenderCall(sender.calls); err != nil {
+		t.Fatalf("prime send returned error: %v", err)
+	}
+	if err := manager.SendLocalStdin(context.Background(), "req-1", []byte("queued input")); err != nil {
+		t.Fatalf("SendLocalStdin returned error: %v", err)
+	}
+	if got := queue.PendingLen(); got != 1 {
+		t.Fatalf("PendingLen before flushLoop = %d, want 1", got)
+	}
+
+	sender.setErrors(wantErr, wantErr, wantErr)
+	local := &Local{
+		queue:         queue,
+		sessions:      manager,
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		flushInterval: time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- local.flushLoop(ctx)
+	}()
+
+	for i := 0; i < outboundFlushMaxFailures; i++ {
+		if err := waitRetryOutboundSenderCall(sender.calls); !errors.Is(err, wantErr) {
+			t.Fatalf("flush call %d error = %v, want %v", i+1, err, wantErr)
+		}
+	}
+	waitLocalSessionsLen(t, manager, 0)
+	if !sub.closed {
+		t.Fatal("local subscriber was not closed")
+	}
+	if got := queue.PendingLen(); got != 0 {
+		t.Fatalf("PendingLen after drop = %d, want 0", got)
+	}
+
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("flushLoop exit error = %v, want context.Canceled", err)
+	}
+}
+
 func newTestLocal(t *testing.T, cfg *config.Config, client *fakeLarkClient) *Local {
 	t.Helper()
 	local, err := NewLocal(LocalOptions{
@@ -288,6 +358,89 @@ func (c *fakeLarkClient) SendRootMessage(_ context.Context, chatID, mentionOpenI
 func (c *fakeLarkClient) ReplyRootMessage(_ context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
 	c.replies = append(c.replies, sentMessage{chatID: chatID, rootMessageID: rootMessageID, mentionOpenID: mentionOpenID, text: text})
 	return "om_reply", nil
+}
+
+type retryOutboundSender struct {
+	mu      sync.Mutex
+	errs    []error
+	calls   chan error
+	replies []sentMessage
+}
+
+func (s *retryOutboundSender) SendRootMessage(ctx context.Context, chatID, mentionOpenID, text string) (outbound.RootMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return outbound.RootMessage{}, err
+	}
+	return outbound.RootMessage{MessageID: "om_root"}, s.record(sentMessage{
+		chatID:        chatID,
+		mentionOpenID: mentionOpenID,
+		text:          text,
+	})
+}
+
+func (s *retryOutboundSender) ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	err := s.record(sentMessage{
+		chatID:        chatID,
+		rootMessageID: rootMessageID,
+		mentionOpenID: mentionOpenID,
+		text:          text,
+	})
+	if err != nil {
+		return "", err
+	}
+	return "om_reply", nil
+}
+
+func (s *retryOutboundSender) record(msg sentMessage) error {
+	s.mu.Lock()
+	s.replies = append(s.replies, msg)
+	var err error
+	if len(s.errs) > 0 {
+		err = s.errs[0]
+		s.errs = s.errs[1:]
+	}
+	s.mu.Unlock()
+
+	if s.calls != nil {
+		s.calls <- err
+	}
+	return err
+}
+
+func (s *retryOutboundSender) setErrors(errs ...error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.errs = append([]error(nil), errs...)
+}
+
+func waitRetryOutboundSenderCall(c <-chan error) error {
+	select {
+	case err := <-c:
+		return err
+	case <-time.After(2 * time.Second):
+		return errors.New("timed out waiting for outbound send")
+	}
+}
+
+func waitLocalSessionsLen(t *testing.T, manager *session.Manager, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if got := len(manager.LocalSessions()); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("LocalSessions did not become %d, got %d", want, len(manager.LocalSessions()))
+		case <-ticker.C:
+		}
+	}
 }
 
 type fakeEventSource struct {
