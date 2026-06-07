@@ -2,7 +2,6 @@ package doctor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
-	"github.com/hachiwii/exec-over-lark/internal/lark"
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 )
 
@@ -37,18 +35,7 @@ func TestRunAllChecksPassWithFakeDaemonAndLark(t *testing.T) {
 		},
 	}
 	larkClient := &fakeLark{
-		token:         "tenant-token-secret",
-		botOpenID:     "ou_self_bot",
-		chatAvailable: true,
-		rootMessageID: "om_ping",
-		peerInChat:    true,
-		bootstrap: BootstrapStatus{
-			Found:         true,
-			Matches:       true,
-			ChatID:        "oc_macmini",
-			BotOpenID:     "ou_server_bot",
-			LastMessageID: "om_bootstrap",
-		},
+		token: "tenant-token-secret",
 	}
 
 	report := Run(context.Background(), Options{
@@ -69,27 +56,24 @@ func TestRunAllChecksPassWithFakeDaemonAndLark(t *testing.T) {
 		CheckDaemonStatus,
 		CheckDaemonSocket,
 		CheckTokenRefresh,
-		CheckBotOpenID,
 		CheckEventConnection,
-		CheckChat,
-		CheckPing,
-		CheckPeerBot,
-		CheckBootstrap,
 		CheckOutboundQueue,
 	} {
 		assertCheckStatus(t, report, id, StatusOK)
 	}
+	assertCheckStatus(t, report, CheckBotOpenID, StatusSkipped)
+	assertCheckStatus(t, report, CheckChat, StatusSkipped)
+	assertCheckStatus(t, report, CheckPeerBot, StatusSkipped)
+	assertCheckStatus(t, report, CheckBootstrap, StatusSkipped)
+	assertCheckMissing(t, report, "ping_root_message")
 	if got := len(daemon.requests); got != 1 {
 		t.Fatalf("daemon requests = %d, want 1", got)
 	}
 	if daemon.requests[0].Host != "macmini" {
 		t.Fatalf("daemon host = %q, want macmini", daemon.requests[0].Host)
 	}
-	if got := len(larkClient.sentRoots); got != 1 {
-		t.Fatalf("root pings = %d, want 1", got)
-	}
-	if larkClient.sentRoots[0].chatID != "oc_macmini" || larkClient.sentRoots[0].mentionOpenID != "ou_server_bot" {
-		t.Fatalf("root ping target = %#v", larkClient.sentRoots[0])
+	if larkClient.tokenCalls != 1 {
+		t.Fatalf("token calls = %d, want 1", larkClient.tokenCalls)
 	}
 
 	text := report.Text()
@@ -126,18 +110,7 @@ func TestRunReportsFailuresWarningsAndRedactsSecrets(t *testing.T) {
 		},
 	}
 	larkClient := &fakeLark{
-		tokenErr:      fmt.Errorf("auth failed app_secret=%s bearer raw-access-token", secret),
-		botOpenID:     "ou_self_bot",
-		chatAvailable: false,
-		sendErr:       errors.New("send denied tenant_access_token=raw-token"),
-		peerInChat:    false,
-		bootstrap: BootstrapStatus{
-			Found:         true,
-			Matches:       false,
-			ChatID:        "oc_wrong",
-			BotOpenID:     "ou_wrong",
-			LastMessageID: "om_bootstrap",
-		},
+		tokenErr: fmt.Errorf("auth failed app_secret=%s bearer raw-access-token", secret),
 	}
 
 	report := Run(context.Background(), Options{
@@ -155,11 +128,12 @@ func TestRunReportsFailuresWarningsAndRedactsSecrets(t *testing.T) {
 	assertCheckStatus(t, report, CheckDaemonSocket, StatusFailed)
 	assertCheckStatus(t, report, CheckTokenRefresh, StatusFailed)
 	assertCheckStatus(t, report, CheckEventConnection, StatusFailed)
-	assertCheckStatus(t, report, CheckChat, StatusFailed)
-	assertCheckStatus(t, report, CheckPing, StatusFailed)
-	assertCheckStatus(t, report, CheckPeerBot, StatusFailed)
-	assertCheckStatus(t, report, CheckBootstrap, StatusFailed)
+	assertCheckStatus(t, report, CheckBotOpenID, StatusSkipped)
+	assertCheckStatus(t, report, CheckChat, StatusSkipped)
+	assertCheckStatus(t, report, CheckPeerBot, StatusSkipped)
+	assertCheckStatus(t, report, CheckBootstrap, StatusSkipped)
 	assertCheckStatus(t, report, CheckOutboundQueue, StatusWarning)
+	assertCheckMissing(t, report, "ping_root_message")
 
 	text := report.Text()
 	for _, forbidden := range []string{secret, "raw-access-token", "raw-token"} {
@@ -203,8 +177,7 @@ func TestRunAcceptsInMemoryFakeConfig(t *testing.T) {
 	}
 
 	report := Run(context.Background(), Options{
-		Config:   cfg,
-		SkipPing: true,
+		Config: cfg,
 	})
 
 	if report.Failed() {
@@ -263,6 +236,13 @@ func assertCheckStatus(t *testing.T, report Report, id CheckID, want Status) {
 	}
 }
 
+func assertCheckMissing(t *testing.T, report Report, id CheckID) {
+	t.Helper()
+	if _, ok := report.Check(id); ok {
+		t.Fatalf("unexpected check %s in report:\n%s", id, report.Text())
+	}
+}
+
 type fakeDaemon struct {
 	status   DaemonStatus
 	err      error
@@ -277,71 +257,16 @@ func (f *fakeDaemon) Status(_ context.Context, req DaemonStatusRequest) (DaemonS
 	return f.status, nil
 }
 
-type fakeRootSend struct {
-	chatID        string
-	mentionOpenID string
-	text          string
-}
-
 type fakeLark struct {
-	token     string
-	tokenErr  error
-	botOpenID string
-	botErr    error
-
-	chatAvailable bool
-	chatErr       error
-
-	rootMessageID string
-	sendErr       error
-	sentRoots     []fakeRootSend
-
-	peerInChat bool
-	peerErr    error
-
-	bootstrap    BootstrapStatus
-	bootstrapErr error
+	token      string
+	tokenErr   error
+	tokenCalls int
 }
 
 func (f *fakeLark) TenantAccessToken(context.Context) (string, error) {
+	f.tokenCalls++
 	if f.tokenErr != nil {
 		return "", f.tokenErr
 	}
 	return f.token, nil
-}
-
-func (f *fakeLark) BotOpenID(context.Context) (string, error) {
-	if f.botErr != nil {
-		return "", f.botErr
-	}
-	return f.botOpenID, nil
-}
-
-func (f *fakeLark) ChatAvailable(_ context.Context, chatID string) (bool, error) {
-	if f.chatErr != nil {
-		return false, f.chatErr
-	}
-	return f.chatAvailable, nil
-}
-
-func (f *fakeLark) SendRootMessage(_ context.Context, chatID, mentionOpenID, text string) (lark.RootMessage, error) {
-	f.sentRoots = append(f.sentRoots, fakeRootSend{chatID: chatID, mentionOpenID: mentionOpenID, text: text})
-	if f.sendErr != nil {
-		return lark.RootMessage{}, f.sendErr
-	}
-	return lark.RootMessage{MessageID: f.rootMessageID}, nil
-}
-
-func (f *fakeLark) PeerBotInChat(_ context.Context, chatID, peerBotOpenID string) (bool, error) {
-	if f.peerErr != nil {
-		return false, f.peerErr
-	}
-	return f.peerInChat, nil
-}
-
-func (f *fakeLark) BootstrapStatus(_ context.Context, chatID, peerBotOpenID string) (BootstrapStatus, error) {
-	if f.bootstrapErr != nil {
-		return BootstrapStatus{}, f.bootstrapErr
-	}
-	return f.bootstrap, nil
 }

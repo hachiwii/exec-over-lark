@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
-	"github.com/hachiwii/exec-over-lark/internal/lark"
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
@@ -42,7 +41,6 @@ const (
 	CheckBotOpenID         CheckID = "bot_open_id"
 	CheckEventConnection   CheckID = "event_connection"
 	CheckChat              CheckID = "chat"
-	CheckPing              CheckID = "ping_root_message"
 	CheckPeerBot           CheckID = "peer_bot"
 	CheckBootstrap         CheckID = "bootstrap"
 	CheckOutboundQueue     CheckID = "outbound_queue"
@@ -119,7 +117,6 @@ type Options struct {
 
 	Now         func() time.Time
 	DialTimeout time.Duration
-	SkipPing    bool
 }
 
 type Daemon interface {
@@ -165,32 +162,6 @@ type OutboundQueueStatus struct {
 
 type LarkClient interface {
 	TenantAccessToken(ctx context.Context) (string, error)
-	BotOpenID(ctx context.Context) (string, error)
-}
-
-type RootMessageSender interface {
-	SendRootMessage(ctx context.Context, chatID, mentionOpenID, text string) (lark.RootMessage, error)
-}
-
-type ChatChecker interface {
-	ChatAvailable(ctx context.Context, chatID string) (bool, error)
-}
-
-type PeerBotChecker interface {
-	PeerBotInChat(ctx context.Context, chatID, peerBotOpenID string) (bool, error)
-}
-
-type BootstrapChecker interface {
-	BootstrapStatus(ctx context.Context, chatID, peerBotOpenID string) (BootstrapStatus, error)
-}
-
-type BootstrapStatus struct {
-	Found         bool
-	Matches       bool
-	ChatID        string
-	BotOpenID     string
-	LastMessageID string
-	CheckedAt     time.Time
 }
 
 func OutboundStatusFromQueue(q *outbound.Queue) OutboundQueueStatus {
@@ -253,7 +224,7 @@ func (r *runner) run(ctx context.Context) {
 
 	socketPath := r.socketPath(cfg)
 	daemonStatus, hasDaemonStatus := r.checkDaemon(ctx, socketPath)
-	r.checkLark(ctx, hostName, host, hasHost)
+	r.checkLark(ctx, host, hasHost)
 	r.checkEventStatus(daemonStatus, hasDaemonStatus)
 	r.checkOutboundStatus(daemonStatus, hasDaemonStatus)
 }
@@ -425,12 +396,11 @@ func (r *runner) checkDaemon(ctx context.Context, socketPath string) (DaemonStat
 	return DaemonStatus{}, false
 }
 
-func (r *runner) checkLark(ctx context.Context, hostName string, host config.HostConfig, hasHost bool) {
+func (r *runner) checkLark(ctx context.Context, host config.HostConfig, hasHost bool) {
 	if r.opts.Lark == nil {
 		r.add(CheckTokenRefresh, StatusSkipped, "lark client was not configured", "")
 		r.add(CheckBotOpenID, StatusSkipped, "lark client was not configured", "")
 		r.add(CheckChat, StatusSkipped, "lark client was not configured", "")
-		r.add(CheckPing, StatusSkipped, "lark client was not configured", "")
 		r.add(CheckPeerBot, StatusSkipped, "lark client was not configured", "")
 		r.add(CheckBootstrap, StatusSkipped, "lark client was not configured", "")
 		return
@@ -446,80 +416,18 @@ func (r *runner) checkLark(ctx context.Context, hostName string, host config.Hos
 		r.add(CheckTokenRefresh, StatusOK, "tenant access token can be refreshed", "")
 	}
 
-	openID, err := r.opts.Lark.BotOpenID(ctx)
-	if err != nil {
-		r.add(CheckBotOpenID, StatusFailed, "self bot open_id lookup failed", err.Error())
-	} else if strings.TrimSpace(openID) == "" {
-		r.add(CheckBotOpenID, StatusFailed, "self bot open_id lookup returned empty", "")
-	} else {
-		r.add(CheckBotOpenID, StatusOK, "self bot open_id is available", openID)
-	}
+	r.add(CheckBotOpenID, StatusSkipped, "bot open_id lookup is not performed by doctor", "")
 
 	if !hasHost {
 		r.add(CheckChat, StatusSkipped, "host-specific chat check was skipped", "")
-		r.add(CheckPing, StatusSkipped, "host-specific ping was skipped", "")
 		r.add(CheckPeerBot, StatusSkipped, "host-specific peer bot check was skipped", "")
 		r.add(CheckBootstrap, StatusSkipped, "host-specific bootstrap check was skipped", "")
 		return
 	}
 
-	if checker, ok := r.opts.Lark.(ChatChecker); ok {
-		available, err := checker.ChatAvailable(ctx, host.ChatID)
-		if err != nil {
-			r.add(CheckChat, StatusFailed, "chat check failed", err.Error())
-		} else if !available {
-			r.add(CheckChat, StatusFailed, "configured chat is not available to the bot", host.ChatID)
-		} else {
-			r.add(CheckChat, StatusOK, "configured chat is available", host.ChatID)
-		}
-	} else {
-		r.add(CheckChat, StatusSkipped, "chat availability check is not supported by this lark client", host.ChatID)
-	}
-
-	if r.opts.SkipPing {
-		r.add(CheckPing, StatusSkipped, "root message ping disabled", "")
-	} else if sender, ok := r.opts.Lark.(RootMessageSender); ok {
-		root, err := sender.SendRootMessage(ctx, host.ChatID, host.PeerBotOpenID, "doctor ping")
-		if err != nil {
-			r.add(CheckPing, StatusFailed, "root message ping failed", err.Error())
-		} else if strings.TrimSpace(root.MessageID) == "" {
-			r.add(CheckPing, StatusFailed, "root message ping returned no message_id", "")
-		} else {
-			r.add(CheckPing, StatusOK, "root message ping sent", root.MessageID)
-		}
-	} else {
-		r.add(CheckPing, StatusSkipped, "root message ping is not supported by this lark client", "")
-	}
-
-	if checker, ok := r.opts.Lark.(PeerBotChecker); ok {
-		inChat, err := checker.PeerBotInChat(ctx, host.ChatID, host.PeerBotOpenID)
-		if err != nil {
-			r.add(CheckPeerBot, StatusFailed, "peer bot membership check failed", err.Error())
-		} else if !inChat {
-			r.add(CheckPeerBot, StatusFailed, "peer bot is not present in configured chat", fmt.Sprintf("host=%s chat_id=%s peer_bot_open_id=%s", hostName, host.ChatID, host.PeerBotOpenID))
-		} else {
-			r.add(CheckPeerBot, StatusOK, "peer bot is present in configured chat", host.PeerBotOpenID)
-		}
-	} else {
-		r.add(CheckPeerBot, StatusSkipped, "peer bot membership check is not supported by this lark client", host.PeerBotOpenID)
-	}
-
-	if checker, ok := r.opts.Lark.(BootstrapChecker); ok {
-		status, err := checker.BootstrapStatus(ctx, host.ChatID, host.PeerBotOpenID)
-		if err != nil {
-			r.add(CheckBootstrap, StatusFailed, "bootstrap check failed", err.Error())
-		} else if !status.Found {
-			r.add(CheckBootstrap, StatusWarning, "server bootstrap message was not found", host.ChatID)
-		} else if !status.Matches {
-			detail := fmt.Sprintf("bootstrap chat_id=%s bot_openid=%s message_id=%s", status.ChatID, status.BotOpenID, status.LastMessageID)
-			r.add(CheckBootstrap, StatusFailed, "server bootstrap message does not match host config", detail)
-		} else {
-			detail := fmt.Sprintf("message_id=%s", status.LastMessageID)
-			r.add(CheckBootstrap, StatusOK, "server bootstrap message matches host config", detail)
-		}
-	} else {
-		r.add(CheckBootstrap, StatusSkipped, "bootstrap check is not supported by this lark client", "")
-	}
+	r.add(CheckChat, StatusSkipped, "chat availability check is not performed by doctor", host.ChatID)
+	r.add(CheckPeerBot, StatusSkipped, "peer bot membership check is not performed by doctor", host.PeerBotOpenID)
+	r.add(CheckBootstrap, StatusSkipped, "bootstrap history check is not performed by doctor", "")
 }
 
 func (r *runner) checkEventStatus(status DaemonStatus, hasStatus bool) {

@@ -505,7 +505,6 @@ func (a *app) runDoctor(cmd parsedCommand) int {
 		}
 		opts.Config = cfg
 		opts.ConfigPath = ""
-
 		if a.newLarkClient != nil {
 			larkClient, err := a.newLarkClient(cfg)
 			if err != nil {
@@ -544,10 +543,6 @@ type failingLarkClient struct {
 }
 
 func (c failingLarkClient) TenantAccessToken(context.Context) (string, error) {
-	return "", c.err
-}
-
-func (c failingLarkClient) BotOpenID(context.Context) (string, error) {
 	return "", c.err
 }
 

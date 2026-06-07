@@ -243,7 +243,7 @@ elarkd --config ~/.elark/config.toml
 elark hosts
 ```
 
-输出 doctor 报告。当前会检查配置路径、权限、加载和 host 配置，探测 daemon socket，刷新 Lark tenant token，查询本 bot `open_id`。指定 host 时，还会检查本 bot 是否在配置的群里，并发送一条 `doctor ping` root 消息提及 peer bot；peer bot 成员查询和 bootstrap 历史消息查询暂未接入，会在报告里显示 `skipped`：
+输出 doctor 报告。`elark doctor` 会检查本地配置和本地 daemon 状态，并刷新 Lark tenant token 来校验 `app_id`/`app_secret` 是否有效；除此之外不会查询 bot、chat、peer bot、bootstrap 历史，也不会向群里发送 ping 或其他消息。指定 host 时，只会校验本地 host 配置，并把该 host 传给本地 daemon 状态探测；bot、chat、peer bot、bootstrap 等检查会在报告里显示 `skipped`：
 
 ```bash
 elark doctor

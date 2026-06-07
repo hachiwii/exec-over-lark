@@ -15,7 +15,6 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/doctor"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
-	"github.com/hachiwii/exec-over-lark/internal/lark"
 )
 
 func TestHostCommandUsesNonPTYByDefault(t *testing.T) {
@@ -208,10 +207,7 @@ func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 	t.Run("doctor", func(t *testing.T) {
 		startTestUnixSocket(t, filepath.Join(dir, "elarkd.sock"))
 		fakeLark := &fakeDoctorLark{
-			token:         "tenant-token-never-print-me",
-			openID:        "ou_self_bot",
-			chatAvailable: true,
-			rootMessageID: "om_doctor_ping",
+			token: "tenant-token-never-print-me",
 		}
 		app, stdout, stderr := newTestApp(&fakeClient{}, nil)
 		app.newLarkClient = func(*config.Config) (doctor.LarkClient, error) {
@@ -228,9 +224,8 @@ func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 			"[ok] host_config",
 			"[ok] daemon_socket",
 			"[ok] token_refresh",
-			"[ok] bot_open_id",
-			"[ok] chat",
-			"[ok] ping_root_message",
+			"[skipped] bot_open_id",
+			"[skipped] chat",
 			"[skipped] peer_bot",
 			"[skipped] bootstrap",
 		} {
@@ -238,9 +233,11 @@ func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 				t.Fatalf("output = %q, want %q", combined, want)
 			}
 		}
-		if fakeLark.tokenCalls != 1 || fakeLark.openIDCalls != 1 || fakeLark.chatCalls != 1 || fakeLark.rootCalls != 1 {
-			t.Fatalf("doctor lark calls token/openID/chat/root = %d/%d/%d/%d, want 1/1/1/1",
-				fakeLark.tokenCalls, fakeLark.openIDCalls, fakeLark.chatCalls, fakeLark.rootCalls)
+		if fakeLark.tokenCalls != 1 {
+			t.Fatalf("doctor token calls = %d, want 1", fakeLark.tokenCalls)
+		}
+		if strings.Contains(combined, "ping_root_message") {
+			t.Fatalf("doctor still reports ping_root_message: %q", combined)
 		}
 		if strings.Contains(combined, "never-print-me") || strings.Contains(combined, "app_secret") || strings.Contains(combined, "tenant-token-never-print-me") {
 			t.Fatalf("doctor leaked secret material: %q", combined)
@@ -301,12 +298,7 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 		dial:        dialer.dial,
 		startDaemon: func(context.Context, string, io.Writer, io.Writer) error { return nil },
 		newLarkClient: func(*config.Config) (doctor.LarkClient, error) {
-			return &fakeDoctorLark{
-				token:         "tenant-token",
-				openID:        "ou_self_bot",
-				chatAvailable: true,
-				rootMessageID: "om_doctor_ping",
-			}, nil
+			return &fakeDoctorLark{token: "tenant-token"}, nil
 		},
 		getenv: func(key string) string {
 			switch key {
@@ -387,35 +379,13 @@ func (f *fakeClient) Close() error {
 }
 
 type fakeDoctorLark struct {
-	token         string
-	openID        string
-	chatAvailable bool
-	rootMessageID string
-
-	tokenCalls  int
-	openIDCalls int
-	chatCalls   int
-	rootCalls   int
+	token      string
+	tokenCalls int
 }
 
 func (f *fakeDoctorLark) TenantAccessToken(context.Context) (string, error) {
 	f.tokenCalls++
 	return f.token, nil
-}
-
-func (f *fakeDoctorLark) BotOpenID(context.Context) (string, error) {
-	f.openIDCalls++
-	return f.openID, nil
-}
-
-func (f *fakeDoctorLark) ChatAvailable(context.Context, string) (bool, error) {
-	f.chatCalls++
-	return f.chatAvailable, nil
-}
-
-func (f *fakeDoctorLark) SendRootMessage(context.Context, string, string, string) (lark.RootMessage, error) {
-	f.rootCalls++
-	return lark.RootMessage{MessageID: f.rootMessageID}, nil
 }
 
 func startTestUnixSocket(t *testing.T, path string) {
