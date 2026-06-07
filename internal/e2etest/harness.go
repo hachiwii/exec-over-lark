@@ -196,9 +196,6 @@ func NewHarness(opts Options) (*Harness, error) {
 	if len(remoteCfg.AllowedChatIDs) == 0 {
 		remoteCfg.AllowedChatIDs = []string{chatID}
 	}
-	if len(remoteCfg.AllowedSenderOpenIDs) == 0 {
-		remoteCfg.AllowedSenderOpenIDs = []string{clientOpenID}
-	}
 
 	deliveryDelay := opts.DeliveryDelay
 	if deliveryDelay == 0 {
@@ -988,7 +985,6 @@ func cloneConfig(in *config.Config) *config.Config {
 		}
 	}
 	out.Exec.AllowedChatIDs = append([]string(nil), in.Exec.AllowedChatIDs...)
-	out.Exec.AllowedSenderOpenIDs = append([]string(nil), in.Exec.AllowedSenderOpenIDs...)
 	return &out
 }
 

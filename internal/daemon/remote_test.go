@@ -100,7 +100,7 @@ func TestRemoteRunConsumesStartExecutesAndRepliesFrames(t *testing.T) {
 	}
 }
 
-func TestRemoteRunFiltersMentionsAndAllowlistsBeforeProtocolParsing(t *testing.T) {
+func TestRemoteRunFiltersMentionsAndChatAllowlistBeforeProtocolParsing(t *testing.T) {
 	events := []string{
 		string(remoteEventJSON(t, remoteEventOptions{
 			EventID:      "evt_wrong_chat",
@@ -109,14 +109,6 @@ func TestRemoteRunFiltersMentionsAndAllowlistsBeforeProtocolParsing(t *testing.T
 			SenderOpenID: "ou_allowed",
 			SelfOpenID:   "ou_self_bot",
 			Text:         lark.BuildMentionedText("ou_self_bot", "EOL1 not-a-valid-frame"),
-		})),
-		string(remoteEventJSON(t, remoteEventOptions{
-			EventID:      "evt_wrong_sender",
-			MessageID:    "om_wrong_sender",
-			ChatID:       "oc_allowed",
-			SenderOpenID: "ou_other",
-			SelfOpenID:   "ou_self_bot",
-			Text:         lark.BuildMentionedText("ou_self_bot", "EOL1 also-invalid"),
 		})),
 		string(remoteEventJSON(t, remoteEventOptions{
 			EventID:      "evt_unmentioned",
@@ -131,10 +123,9 @@ func TestRemoteRunFiltersMentionsAndAllowlistsBeforeProtocolParsing(t *testing.T
 	fakeLark := &fakeLarkClient{}
 	executor := &fakeRemoteExecutor{}
 	remote := newTestRemote(t, strings.NewReader(strings.Join(events, "\n")+"\n"), fakeLark, executor, RemoteConfig{
-		ExecEnabled:          true,
-		DefaultShell:         "/bin/zsh",
-		AllowedChatIDs:       []string{"oc_allowed"},
-		AllowedSenderOpenIDs: []string{"ou_allowed"},
+		ExecEnabled:    true,
+		DefaultShell:   "/bin/zsh",
+		AllowedChatIDs: []string{"oc_allowed"},
 	})
 
 	if err := remote.Run(context.Background()); err != nil {
@@ -145,6 +136,45 @@ func TestRemoteRunFiltersMentionsAndAllowlistsBeforeProtocolParsing(t *testing.T
 	}
 	if len(fakeLark.replies) != 0 {
 		t.Fatalf("replies = %#v, want none", fakeLark.replies)
+	}
+}
+
+func TestRemoteRunDoesNotFilterSenderOpenID(t *testing.T) {
+	start := protocol.StartPayload{Cmd: "printf ok", Heartbeat: protocol.HeartbeatConfig{Timeout: "30s"}}
+	event := remoteEventJSON(t, remoteEventOptions{
+		EventID:      "evt_other_sender",
+		MessageID:    "om_root",
+		ChatID:       "oc_allowed",
+		SenderOpenID: "ou_any_sender",
+		SelfOpenID:   "ou_self_bot",
+		Text:         lark.BuildMentionedText("ou_self_bot", encodeRemoteFrames(t, jsonFrame(t, 1, protocol.TypeStart, start))),
+	})
+
+	fakeLark := &fakeLarkClient{}
+	executor := &fakeRemoteExecutor{
+		process: &fakeRemoteProcess{
+			result: remoteexec.Result{ExitCode: 0},
+		},
+	}
+	remote := newTestRemote(t, strings.NewReader(string(event)+"\n"), fakeLark, executor, RemoteConfig{
+		ExecEnabled:    true,
+		DefaultShell:   "/bin/zsh",
+		AllowedChatIDs: []string{"oc_allowed"},
+	})
+
+	if err := remote.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(executor.requests) != 1 {
+		t.Fatalf("executor requests = %d, want 1", len(executor.requests))
+	}
+	if len(fakeLark.replies) == 0 {
+		t.Fatal("expected replies to arbitrary sender")
+	}
+	for _, reply := range fakeLark.replies {
+		if reply.mentionOpenID != "ou_any_sender" {
+			t.Fatalf("reply mentionOpenID = %q, want ou_any_sender", reply.mentionOpenID)
+		}
 	}
 }
 

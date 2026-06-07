@@ -45,11 +45,6 @@ func runLoopbackE2E(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	clientOpenID := "ou_loopback_client"
-	if len(cfg.Exec.AllowedSenderOpenIDs) > 0 && strings.TrimSpace(cfg.Exec.AllowedSenderOpenIDs[0]) != "" {
-		clientOpenID = strings.TrimSpace(cfg.Exec.AllowedSenderOpenIDs[0])
-	}
-
 	var mirror e2etest.MirrorOptions
 	if mirrorPath := strings.TrimSpace(os.Getenv(loopbackE2EMirrorFixtureEnv)); mirrorPath != "" {
 		created, err := e2etest.RealLarkMirrorFromFixture(mirrorPath)
@@ -63,7 +58,7 @@ func runLoopbackE2E(args []string, stdout, stderr io.Writer) int {
 	h, err := e2etest.NewHarness(e2etest.Options{
 		HostName:           hostName,
 		ChatID:             host.ChatID,
-		ClientBotOpenID:    clientOpenID,
+		ClientBotOpenID:    "ou_loopback_client",
 		ServerBotOpenID:    host.PeerBotOpenID,
 		SocketPath:         cfg.IPC.SocketPath,
 		LocalConfig:        cfg,

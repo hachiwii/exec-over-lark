@@ -42,7 +42,7 @@ Read `.local/exec-over-lark-technical-design.md` before implementation. The test
 - Fixed process output shutdown handling in the remote daemon so normal closed pipe/read-closed conditions during command teardown are treated as EOF instead of protocol failures.
 - Wired the production `elarkd` path to a native Feishu websocket event source. It decodes persistent-connection protobuf frames, parses the raw V2 event payload directly, and acknowledges frames over the same websocket connection.
 - Wired server-side `elarkd` startup to `RemoteDaemon` when `exec.enabled=true` and `ipc.enabled=false`.
-- Added optional `hosts.<name>.peer_sender_open_id` because Feishu mention IDs and event sender IDs can differ for bot apps. `peer_bot_open_id` remains the mention target, while `peer_sender_open_id` is used for client-side reply matching.
+- Removed OpenID-based sender matching and sender allowlists. Chat allowlists remain the supported server-side scope control.
 
 ## Manual Two-Daemon Real Chain
 

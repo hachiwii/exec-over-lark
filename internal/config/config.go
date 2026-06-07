@@ -64,18 +64,16 @@ type ConnectionConfig struct {
 }
 
 type ExecConfig struct {
-	Enabled              bool     `toml:"enabled"`
-	DefaultShell         string   `toml:"default_shell"`
-	MaxSessions          int      `toml:"max_sessions"`
-	StreamChunkBytes     int      `toml:"stream_chunk_bytes"`
-	AllowedChatIDs       []string `toml:"allowed_chat_ids"`
-	AllowedSenderOpenIDs []string `toml:"allowed_sender_open_ids"`
+	Enabled          bool     `toml:"enabled"`
+	DefaultShell     string   `toml:"default_shell"`
+	MaxSessions      int      `toml:"max_sessions"`
+	StreamChunkBytes int      `toml:"stream_chunk_bytes"`
+	AllowedChatIDs   []string `toml:"allowed_chat_ids"`
 }
 
 type HostConfig struct {
 	ChatID           string `toml:"chat_id"`
 	PeerBotOpenID    string `toml:"peer_bot_open_id"`
-	PeerSenderOpenID string `toml:"peer_sender_open_id"`
 	Shell            string `toml:"shell"`
 	StreamChunkBytes int    `toml:"stream_chunk_bytes"`
 	DefaultCWD       string `toml:"default_cwd"`
@@ -325,11 +323,6 @@ func Validate(cfg *Config) error {
 		if err := validateLarkID("hosts."+name+".peer_bot_open_id", host.PeerBotOpenID, "ou_"); err != nil {
 			return err
 		}
-		if strings.TrimSpace(host.PeerSenderOpenID) != "" {
-			if err := validateLarkID("hosts."+name+".peer_sender_open_id", host.PeerSenderOpenID, "ou_"); err != nil {
-				return err
-			}
-		}
 		if host.StreamChunkBytes <= 0 {
 			return fmt.Errorf("hosts.%s.stream_chunk_bytes must be greater than zero", name)
 		}
@@ -356,17 +349,6 @@ func Validate(cfg *Config) error {
 			}
 		}
 	}
-	if cfg.Exec.AllowedSenderOpenIDs != nil {
-		if len(cfg.Exec.AllowedSenderOpenIDs) == 0 {
-			return errors.New("exec.allowed_sender_open_ids must be omitted or non-empty")
-		}
-		for i, id := range cfg.Exec.AllowedSenderOpenIDs {
-			if err := validateLarkID(fmt.Sprintf("exec.allowed_sender_open_ids[%d]", i), id, "ou_"); err != nil {
-				return err
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -543,7 +525,6 @@ enabled = true
 default_shell = "/bin/zsh"
 max_sessions = 8
 stream_chunk_bytes = 12000
-# Optional allowlists. Omit these fields to allow all chats or senders.
+# Optional chat allowlist. Omit this field to allow all chats.
 # allowed_chat_ids = ["oc_xxx", "oc_yyy"]
-# allowed_sender_open_ids = ["ou_client_bot"]
 `

@@ -6,7 +6,7 @@
 
 - 本地用户运行 `elark` CLI。
 - 本地 `elarkd` 读取 host 配置，通过本地 Unix socket 接收 CLI 请求，并用 client bot 在飞书话题群里创建 root message。
-- 远端 `elarkd` 使用 server bot 监听飞书消息，校验 bot 身份、群和发送方后，在远端机器执行命令或 PTY shell。
+- 远端 `elarkd` 使用 server bot 监听飞书消息，校验 bot 提及和群后，在远端机器执行命令或 PTY shell。
 - 每个飞书 root message 对应一个连接，后续输入、输出、心跳和退出状态都通过该 root message 的回复消息传输。
 
 ## 功能边界
@@ -17,7 +17,7 @@
 - 默认登录 shell：`elark macmini`
 - 强制 PTY：`elark -t macmini 'vim file'`
 - stdin/stdout/stderr 与远端 exit code 传递
-- 双 bot 身份、群成员关系、可选 chat/sender 白名单
+- 双 bot 身份、群成员关系、可选 chat 白名单
 - 发送限流、同连接消息聚合和大输出拆分
 
 不支持：
@@ -198,8 +198,6 @@ max_sessions = 8
 stream_chunk_bytes = 12000
 # 不设置表示允许所有 chat；设置后只处理列表内 chat。
 # allowed_chat_ids = ["oc_xxx", "oc_yyy"]
-# 不设置表示允许所有 sender；设置后只处理列表内 OpenID。
-# allowed_sender_open_ids = ["ou_client_bot"]
 ```
 
 远端侧字段说明：
@@ -211,7 +209,6 @@ stream_chunk_bytes = 12000
 - `exec.max_sessions`：远端同时执行的 session 上限，默认 `8`。
 - `exec.stream_chunk_bytes`：远端 stdout/stderr 切片大小，默认 `12000`。
 - `exec.allowed_chat_ids`：可选 chat 白名单。不配置表示允许所有 chat。
-- `exec.allowed_sender_open_ids`：可选发送方 OpenID 白名单。不配置表示允许所有 sender。
 
 所有时间字段都使用字符串，支持 `ms`、`s`、`m`、`h`、`d`，例如 `"1000ms"`、`"10s"`、`"5m"`、`"1h"`。
 
@@ -334,7 +331,7 @@ EOL1 <seq> <type> <base64_payload>
 ## 安全建议
 
 - 始终保持配置文件权限为 `0600`，配置目录权限为 `0700`。
-- 远端侧建议显式配置 `exec.allowed_chat_ids` 和 `exec.allowed_sender_open_ids`。
+- 远端侧建议显式配置 `exec.allowed_chat_ids`。
 - 不要把 server bot 拉入不可信群。
 - 不要在群里发送不希望群成员、管理员或合规审计看到的命令和输出。
 - 不要把 `lark.app_secret` 写入日志、截图或公开文档。

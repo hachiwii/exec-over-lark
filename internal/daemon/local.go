@@ -351,7 +351,7 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 		ConnID:        connID,
 		RootMessageID: connID,
 		ChatID:        host.ChatID,
-		PeerBotOpenID: firstLocalNonEmpty(host.PeerSenderOpenID, host.PeerBotOpenID),
+		PeerBotOpenID: host.PeerBotOpenID,
 		NextSendSeq:   2,
 	}, subscriber); err != nil {
 		return "", err
@@ -395,8 +395,7 @@ func (d *Local) LocalSessions() []session.Snapshot {
 
 func (d *Local) eventMatchesConfiguredHost(event lark.MessageEvent) bool {
 	for _, host := range d.cfg.Hosts {
-		peerSender := firstLocalNonEmpty(host.PeerSenderOpenID, host.PeerBotOpenID)
-		if event.ChatID == host.ChatID && event.SenderOpenID == peerSender {
+		if event.ChatID == host.ChatID && event.SenderOpenID == host.PeerBotOpenID {
 			return true
 		}
 	}

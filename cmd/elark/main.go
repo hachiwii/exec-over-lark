@@ -536,7 +536,6 @@ func cloneConfig(cfg *config.Config) *config.Config {
 		}
 	}
 	out.Exec.AllowedChatIDs = append([]string(nil), cfg.Exec.AllowedChatIDs...)
-	out.Exec.AllowedSenderOpenIDs = append([]string(nil), cfg.Exec.AllowedSenderOpenIDs...)
 	return &out
 }
 

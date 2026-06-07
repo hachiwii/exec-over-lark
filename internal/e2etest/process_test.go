@@ -182,7 +182,6 @@ default_shell = "/bin/sh"
 max_sessions = 8
 stream_chunk_bytes = 512
 allowed_chat_ids = [%q]
-allowed_sender_open_ids = [%q]
 
 [hosts.loopback]
 chat_id = %q
@@ -190,7 +189,7 @@ peer_bot_open_id = %q
 shell = "/bin/sh"
 stream_chunk_bytes = 512
 default_cwd = %q
-`, socketPath, chatID, clientOpenID, chatID, serverOpenID, cwd)
+`, socketPath, chatID, chatID, serverOpenID, cwd)
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write process e2e config: %v", err)
 	}

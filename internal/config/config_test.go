@@ -82,7 +82,7 @@ func TestWriteInitTemplateRejectsExistingWithoutForce(t *testing.T) {
 		t.Fatalf("force WriteInitTemplate returned error: %v", err)
 	}
 	assertMode(t, path, 0o600)
-	if got := readFile(t, path); !strings.Contains(got, "allowed_sender_open_ids") {
+	if got := readFile(t, path); !strings.Contains(got, "allowed_chat_ids") {
 		t.Fatalf("server template was not written:\n%s", got)
 	}
 }

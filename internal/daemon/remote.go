@@ -50,12 +50,11 @@ type RemoteProcess interface {
 }
 
 type RemoteConfig struct {
-	ExecEnabled          bool
-	DefaultShell         string
-	MaxSessions          int
-	StreamChunkBytes     int
-	AllowedChatIDs       []string
-	AllowedSenderOpenIDs []string
+	ExecEnabled      bool
+	DefaultShell     string
+	MaxSessions      int
+	StreamChunkBytes int
+	AllowedChatIDs   []string
 
 	SendCooldown              time.Duration
 	LarkTextRequestLimitBytes int
@@ -84,8 +83,7 @@ type RemoteDaemon struct {
 	queue   *outbound.Queue
 	manager *session.Manager
 
-	allowedChats   map[string]struct{}
-	allowedSenders map[string]struct{}
+	allowedChats map[string]struct{}
 
 	mu    sync.Mutex
 	tasks map[string]*remoteTask
@@ -102,7 +100,6 @@ func RemoteConfigFromConfig(cfg *config.Config) RemoteConfig {
 		MaxSessions:               cfg.Exec.MaxSessions,
 		StreamChunkBytes:          cfg.Exec.StreamChunkBytes,
 		AllowedChatIDs:            cfg.Exec.AllowedChatIDs,
-		AllowedSenderOpenIDs:      cfg.Exec.AllowedSenderOpenIDs,
 		SendCooldown:              cfg.Lark.SendCooldown.Duration(),
 		LarkTextRequestLimitBytes: cfg.Lark.LarkTextRequestLimitBytes,
 		HeartbeatInterval:         cfg.Connection.HeartbeatInterval.Duration(),
@@ -147,17 +144,16 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 	)
 
 	return &RemoteDaemon{
-		cfg:            cfg,
-		eventStream:    opts.EventStream,
-		eventSource:    opts.EventSource,
-		selfBotOpenID:  strings.TrimSpace(opts.SelfBotOpenID),
-		sender:         opts.Sender,
-		executor:       executor,
-		queue:          queue,
-		manager:        manager,
-		allowedChats:   stringSet(cfg.AllowedChatIDs),
-		allowedSenders: stringSet(cfg.AllowedSenderOpenIDs),
-		tasks:          make(map[string]*remoteTask),
+		cfg:           cfg,
+		eventStream:   opts.EventStream,
+		eventSource:   opts.EventSource,
+		selfBotOpenID: strings.TrimSpace(opts.SelfBotOpenID),
+		sender:        opts.Sender,
+		executor:      executor,
+		queue:         queue,
+		manager:       manager,
+		allowedChats:  stringSet(cfg.AllowedChatIDs),
+		tasks:         make(map[string]*remoteTask),
 	}, nil
 }
 
@@ -227,7 +223,7 @@ func (d *RemoteDaemon) HandleMessageEvent(ctx context.Context, event lark.Messag
 	if !mentionsContain(event.Mentions, d.selfBotOpenID) {
 		return lark.ErrIgnoredEvent
 	}
-	if !d.allowedChat(event.ChatID) || !d.allowedSender(event.SenderOpenID) {
+	if !d.allowedChat(event.ChatID) {
 		return lark.ErrIgnoredEvent
 	}
 
@@ -306,7 +302,7 @@ func (d *RemoteDaemon) parseEventJSON(data []byte) (lark.MessageEvent, error) {
 	if !mentionsContain(meta.mentions, d.selfBotOpenID) {
 		return lark.MessageEvent{}, lark.ErrIgnoredEvent
 	}
-	if !d.allowedChat(meta.chatID) || !d.allowedSender(meta.senderOpenID) {
+	if !d.allowedChat(meta.chatID) {
 		return lark.MessageEvent{}, lark.ErrIgnoredEvent
 	}
 	return lark.ParseMessageReceiveEvent(data, d.selfBotOpenID)
@@ -317,14 +313,6 @@ func (d *RemoteDaemon) allowedChat(chatID string) bool {
 		return true
 	}
 	_, ok := d.allowedChats[chatID]
-	return ok
-}
-
-func (d *RemoteDaemon) allowedSender(openID string) bool {
-	if len(d.allowedSenders) == 0 {
-		return true
-	}
-	_, ok := d.allowedSenders[openID]
 	return ok
 }
 
