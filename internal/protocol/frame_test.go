@@ -193,6 +193,9 @@ func TestRecvWindowBuffersOutOfOrderAndDrainsWhenGapFills(t *testing.T) {
 	if !result.Duplicate || result.Buffered {
 		t.Fatalf("duplicate pending result = %#v, want duplicate", result)
 	}
+	if !window.GapStartedAt.Equal(clock.Now().Add(-time.Second)) {
+		t.Fatalf("duplicate pending reset gap timer to %s", window.GapStartedAt)
+	}
 
 	delivered, err := window.Receive(Frame{Seq: 1, Type: TypeStdout, Payload: []byte("a")})
 	if err != nil {
@@ -201,6 +204,9 @@ func TestRecvWindowBuffersOutOfOrderAndDrainsWhenGapFills(t *testing.T) {
 	assertSeqs(t, delivered, 1)
 	if !window.GapOpen {
 		t.Fatal("gap should remain open because seq 2 is still missing")
+	}
+	if !window.GapStartedAt.Equal(clock.Now()) {
+		t.Fatalf("GapStartedAt after window move = %s, want %s", window.GapStartedAt, clock.Now())
 	}
 	if got := window.PendingSeqs(); !reflect.DeepEqual(got, []uint64{3}) {
 		t.Fatalf("PendingSeqs = %v, want [3]", got)
@@ -213,6 +219,32 @@ func TestRecvWindowBuffersOutOfOrderAndDrainsWhenGapFills(t *testing.T) {
 	assertSeqs(t, delivered, 2, 3)
 	if window.GapOpen || len(window.PendingFrames) != 0 || window.NextExpectedSeq != 4 {
 		t.Fatalf("window after drain = %#v, want closed gap and next 4", window)
+	}
+}
+
+func TestRecvWindowResetsGapTimerWhenWindowMoves(t *testing.T) {
+	clock := newFakeClock()
+	window := NewRecvWindow(5*time.Second, WithClock(clock))
+
+	if _, err := window.Receive(Frame{Seq: 3, Type: TypeStdout, Payload: []byte("c")}); err != nil {
+		t.Fatalf("Receive seq 3 returned error: %v", err)
+	}
+	firstGapStartedAt := window.GapStartedAt
+	clock.Advance(4 * time.Second)
+	if _, err := window.Receive(Frame{Seq: 1, Type: TypeStdout, Payload: []byte("a")}); err != nil {
+		t.Fatalf("Receive seq 1 returned error: %v", err)
+	}
+	if !window.GapStartedAt.After(firstGapStartedAt) || !window.GapStartedAt.Equal(clock.Now()) {
+		t.Fatalf("GapStartedAt = %s, want reset to %s", window.GapStartedAt, clock.Now())
+	}
+
+	clock.Advance(4 * time.Second)
+	if err := window.CheckGapTimeout(); err != nil {
+		t.Fatalf("CheckGapTimeout before reset deadline returned error: %v", err)
+	}
+	clock.Advance(time.Second)
+	if err := window.CheckGapTimeout(); !errors.Is(err, ErrSequenceGapTimeout) {
+		t.Fatalf("CheckGapTimeout at reset deadline error = %v, want ErrSequenceGapTimeout", err)
 	}
 }
 

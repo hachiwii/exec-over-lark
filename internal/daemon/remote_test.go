@@ -168,6 +168,7 @@ func TestRemoteRunDoesNotFilterSenderOpenID(t *testing.T) {
 	if len(executor.requests) != 1 {
 		t.Fatalf("executor requests = %d, want 1", len(executor.requests))
 	}
+	waitReplyFramesLen(t, fakeLark, 1)
 	if len(fakeLark.replies) == 0 {
 		t.Fatal("expected replies to arbitrary sender")
 	}
