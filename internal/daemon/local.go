@@ -298,6 +298,10 @@ func (d *Local) Close(ctx context.Context, req ipc.CloseRequest) error {
 	return d.sessions.CloseLocal(ctx, req.RequestID, req.Reason)
 }
 
+func (d *Local) CloseConn(ctx context.Context, req ipc.CloseConnRequest) error {
+	return d.sessions.CloseLocalByConn(ctx, req.ConnID, req.Reason)
+}
+
 func (d *Local) Status(_ context.Context, _ ipc.StatusRequest) (ipc.DaemonStatus, error) {
 	d.mu.RLock()
 	started := d.started
@@ -319,6 +323,25 @@ func (d *Local) Status(_ context.Context, _ ipc.StatusRequest) (ipc.DaemonStatus
 		},
 		Outbound: outboundStatusFromManager(d.outbound),
 	}, nil
+}
+
+func (d *Local) Sessions(context.Context, ipc.SessionsRequest) ([]ipc.SessionInfo, error) {
+	snapshots := d.sessions.LocalSessions()
+	out := make([]ipc.SessionInfo, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		state := "open"
+		if snapshot.Closed {
+			state = "closed"
+		}
+		out = append(out, ipc.SessionInfo{
+			ConnID:            snapshot.ConnID,
+			Host:              snapshot.Host,
+			StartedAt:         snapshot.StartedAt,
+			LastPeerMessageAt: snapshot.LastPeerMessageAt,
+			State:             state,
+		})
+	}
+	return out, nil
 }
 
 func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionRequest, subscriber session.Subscriber) (string, error) {

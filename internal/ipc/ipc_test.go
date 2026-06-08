@@ -119,11 +119,46 @@ func TestStatusRoundTripOverUnixSocket(t *testing.T) {
 	}
 }
 
+func TestSessionsRoundTripOverUnixSocket(t *testing.T) {
+	requests := make(chan SessionsRequest, 1)
+	startedAt := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
+	lastPeerAt := startedAt.Add(3 * time.Second)
+	server := startTestServer(t, HandlerFuncs{
+		SessionsFunc: func(ctx context.Context, req SessionsRequest) ([]SessionInfo, error) {
+			requests <- req
+			return []SessionInfo{{
+				ConnID:            "om_root",
+				Host:              "macmini",
+				StartedAt:         startedAt,
+				LastPeerMessageAt: lastPeerAt,
+				State:             "open",
+			}}, nil
+		},
+	})
+
+	client := dialTestClient(t, server.SocketPath())
+	defer client.Close()
+
+	sessions, err := client.Sessions(testContext(t), SessionsRequest{RequestID: "sessions-1"})
+	if err != nil {
+		t.Fatalf("Sessions returned error: %v", err)
+	}
+	if req := receiveValue(t, requests); req.RequestID != "sessions-1" {
+		t.Fatalf("sessions request = %#v, want sessions-1", req)
+	}
+	if len(sessions) != 1 || sessions[0].ConnID != "om_root" || sessions[0].Host != "macmini" ||
+		!sessions[0].StartedAt.Equal(startedAt) || !sessions[0].LastPeerMessageAt.Equal(lastPeerAt) ||
+		sessions[0].State != "open" {
+		t.Fatalf("sessions response mismatch: %#v", sessions)
+	}
+}
+
 func TestInputControlsReachHandler(t *testing.T) {
 	stdinCh := make(chan StdinRequest, 1)
 	resizeCh := make(chan ResizeRequest, 1)
 	signalCh := make(chan SignalRequest, 1)
 	closeCh := make(chan CloseRequest, 1)
+	closeConnCh := make(chan CloseConnRequest, 1)
 
 	server := startTestServer(t, HandlerFuncs{
 		StdinFunc: func(ctx context.Context, req StdinRequest) error {
@@ -140,6 +175,10 @@ func TestInputControlsReachHandler(t *testing.T) {
 		},
 		CloseFunc: func(ctx context.Context, req CloseRequest) error {
 			closeCh <- req
+			return nil
+		},
+		CloseConnFunc: func(ctx context.Context, req CloseConnRequest) error {
+			closeConnCh <- req
 			return nil
 		},
 	})
@@ -163,6 +202,9 @@ func TestInputControlsReachHandler(t *testing.T) {
 	if err := client.Cancel(ctx, "req-2", "client closed terminal"); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
+	if err := client.CloseConn(ctx, "om_conn", "kill requested by cli"); err != nil {
+		t.Fatalf("CloseConn returned error: %v", err)
+	}
 
 	if got := receiveValue(t, stdinCh); got.RequestID != "req-2" || string(got.Bytes) != "abc" {
 		t.Fatalf("stdin request mismatch: %#v", got)
@@ -175,6 +217,9 @@ func TestInputControlsReachHandler(t *testing.T) {
 	}
 	if got := receiveValue(t, closeCh); got.RequestID != "req-2" || got.Reason != "client closed terminal" {
 		t.Fatalf("close request mismatch: %#v", got)
+	}
+	if got := receiveValue(t, closeConnCh); got.ConnID != "om_conn" || got.Reason != "kill requested by cli" {
+		t.Fatalf("close_conn request mismatch: %#v", got)
 	}
 }
 

@@ -431,6 +431,10 @@ func (m *Manager) CloseLocal(ctx context.Context, requestID, reason string) erro
 	return err
 }
 
+func (m *Manager) CloseLocalByConn(ctx context.Context, connID, reason string) error {
+	return m.sendLocalConnJSONFrame(ctx, connID, protocol.TypeClose, protocol.ClosePayload{Reason: reason}, true)
+}
+
 func (m *Manager) ReceiveLocal(ctx context.Context, msg InboundMessage) error {
 	connID := normalizeConnID(msg)
 	if strings.TrimSpace(connID) == "" {
@@ -832,6 +836,40 @@ func (m *Manager) sendLocalFrame(ctx context.Context, requestID string, typ prot
 	}
 	sess, ok := m.localByConn[connID]
 	if !ok || sess.base.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrSessionClosed, connID)
+	}
+	if m.outbound == nil {
+		m.mu.Unlock()
+		return ErrNoOutboundManager
+	}
+	m.mu.Unlock()
+	if err := m.outbound.Enqueue(ctx, connID, typ, payload); err != nil {
+		return err
+	}
+	if closeAfter {
+		m.outbound.MarkCloseAfterDrained(connID)
+	}
+	return nil
+}
+
+func (m *Manager) sendLocalConnJSONFrame(ctx context.Context, connID string, typ protocol.FrameType, payload any, closeAfter bool) error {
+	raw, err := protocol.MarshalJSONPayload(payload)
+	if err != nil {
+		return err
+	}
+	return m.sendLocalConnFrame(ctx, connID, typ, raw, closeAfter)
+}
+
+func (m *Manager) sendLocalConnFrame(ctx context.Context, connID string, typ protocol.FrameType, payload []byte, closeAfter bool) error {
+	connID = strings.TrimSpace(connID)
+	m.mu.Lock()
+	sess, ok := m.localByConn[connID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, connID)
+	}
+	if sess.base.closed {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrSessionClosed, connID)
 	}

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
@@ -25,6 +25,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/hachiwii/exec-over-lark/internal/pty"
+	"github.com/hachiwii/exec-over-lark/internal/version"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -42,13 +43,14 @@ type daemonClient interface {
 	Resize(context.Context, string, int, int) error
 	Signal(context.Context, string, string) error
 	CloseSession(context.Context, string, string) error
+	CloseConn(context.Context, string, string) error
 	Status(context.Context, ipc.StatusRequest) (ipc.DaemonStatus, error)
+	Sessions(context.Context, ipc.SessionsRequest) ([]ipc.SessionInfo, error)
 	Receive(context.Context) (ipc.Message, error)
 	Close() error
 }
 
 type dialFunc func(context.Context, string) (daemonClient, error)
-type daemonStarter func(context.Context, string, io.Writer, io.Writer) error
 type terminalRestorer interface {
 	Restore() error
 }
@@ -59,9 +61,8 @@ type app struct {
 	stdout io.Writer
 	stderr io.Writer
 
-	dial        dialFunc
-	startDaemon daemonStarter
-	getenv      func(string) string
+	dial   dialFunc
+	getenv func(string) string
 
 	stdinIsTerminal  func(io.Reader) bool
 	makeRawTerminal  makeRawFunc
@@ -90,22 +91,20 @@ type commandKind int
 
 const (
 	commandHelp commandKind = iota
+	commandVersion
 	commandRemote
 	commandHosts
 	commandDoctor
-	commandDaemon
 	commandSessions
-	commandAttach
 	commandKill
 )
 
 type parsedCommand struct {
-	kind      commandKind
-	opts      globalOptions
-	host      string
-	command   string
-	daemonSub string
-	connID    string
+	kind    commandKind
+	opts    globalOptions
+	host    string
+	command string
+	connID  string
 }
 
 type cliConfig struct {
@@ -132,7 +131,6 @@ func newApp() *app {
 		stdout:           os.Stdout,
 		stderr:           os.Stderr,
 		dial:             dialIPC,
-		startDaemon:      startDaemonProcess,
 		getenv:           os.Getenv,
 		stdinIsTerminal:  stdinIsTerminal,
 		makeRawTerminal:  makeRawTerminal,
@@ -157,18 +155,17 @@ func (a *app) run(args []string) int {
 	case commandHelp:
 		fmt.Fprint(a.stdout, usage())
 		return 0
+	case commandVersion:
+		fmt.Fprintln(a.stdout, version.String())
+		return 0
 	case commandRemote:
 		return a.runRemote(cmd)
 	case commandHosts:
 		return a.runHosts(cmd)
 	case commandDoctor:
 		return a.runDoctor(cmd)
-	case commandDaemon:
-		return a.runDaemon(cmd)
 	case commandSessions:
 		return a.runSessions(cmd)
-	case commandAttach:
-		return a.runAttach(cmd)
 	case commandKill:
 		return a.runKill(cmd)
 	default:
@@ -196,6 +193,9 @@ func parseArgs(args []string) (parsedCommand, error) {
 		switch {
 		case arg == "-h" || arg == "--help":
 			cmd.kind = commandHelp
+			return cmd, nil
+		case arg == "--version":
+			cmd.kind = commandVersion
 			return cmd, nil
 		case arg == "-t" || arg == "--tty":
 			if cmd.opts.tty == ttyNever {
@@ -274,28 +274,11 @@ func parseArgs(args []string) (parsedCommand, error) {
 			return cmd, errors.New("doctor does not take arguments")
 		}
 		cmd.kind = commandDoctor
-	case "daemon":
-		if len(positionals) != 2 {
-			return cmd, errors.New("daemon requires one subcommand: start, status, or stop")
-		}
-		switch positionals[1] {
-		case "start", "status", "stop":
-			cmd.kind = commandDaemon
-			cmd.daemonSub = positionals[1]
-		default:
-			return cmd, fmt.Errorf("unknown daemon subcommand %q", positionals[1])
-		}
 	case "sessions":
 		if len(positionals) != 1 {
 			return cmd, errors.New("sessions does not take arguments")
 		}
 		cmd.kind = commandSessions
-	case "attach":
-		if len(positionals) != 2 {
-			return cmd, errors.New("attach requires a conn_id")
-		}
-		cmd.kind = commandAttach
-		cmd.connID = positionals[1]
 	case "kill":
 		if len(positionals) != 2 {
 			return cmd, errors.New("kill requires a conn_id")
@@ -786,51 +769,33 @@ func cloneConfig(cfg *config.Config) *config.Config {
 	return &out
 }
 
-func (a *app) runDaemon(cmd parsedCommand) int {
+func (a *app) runSessions(cmd parsedCommand) int {
 	socketPath, err := resolveSocketPath(cmd.opts)
 	if err != nil {
 		fmt.Fprintf(a.stderr, "elark: %v\n", err)
 		return 1
 	}
+	ctx, cancel := commandContext(cmd.opts)
+	defer cancel()
 
-	switch cmd.daemonSub {
-	case "status":
-		if a.daemonReachable(cmd.opts, socketPath) {
-			fmt.Fprintf(a.stdout, "elarkd is running at %s\n", socketPath)
-			return 0
-		}
-		fmt.Fprintf(a.stderr, "elarkd is not running at %s\n", socketPath)
+	client, err := a.dial(ctx, socketPath)
+	if err != nil {
+		fmt.Fprintf(a.stderr, "elark: local elarkd is not running at %s; run `elarkd start`\n", socketPath)
 		return 1
-	case "start":
-		if a.daemonReachable(cmd.opts, socketPath) {
-			fmt.Fprintf(a.stdout, "elarkd is already running at %s\n", socketPath)
-			return 0
-		}
-		ctx, cancel := commandContext(cmd.opts)
-		defer cancel()
-		if err := a.startDaemon(ctx, cmd.opts.configPath, a.stdout, a.stderr); err != nil {
-			fmt.Fprintf(a.stderr, "elark: start daemon: %v\n", err)
-			return 1
-		}
-		fmt.Fprintln(a.stdout, "elarkd start requested")
-		return 0
-	case "stop":
-		fmt.Fprintln(a.stderr, "elark daemon stop requires daemon control RPC, which is not available in IPC v1")
-		return 1
-	default:
-		fmt.Fprintf(a.stderr, "elark: unknown daemon subcommand %q\n", cmd.daemonSub)
-		return 2
 	}
-}
+	defer client.Close()
 
-func (a *app) runSessions(cmd parsedCommand) int {
-	fmt.Fprintln(a.stderr, "elark sessions requires daemon sessions RPC, which is not available in IPC v1")
-	return 1
-}
-
-func (a *app) runAttach(cmd parsedCommand) int {
-	fmt.Fprintf(a.stderr, "elark attach %s requires daemon attach RPC, which is not available in IPC v1\n", cmd.connID)
-	return 1
+	sessions, err := client.Sessions(ctx, ipc.SessionsRequest{})
+	if err != nil {
+		fmt.Fprintf(a.stderr, "elark: sessions: %v\n", err)
+		return 1
+	}
+	if len(sessions) == 0 {
+		fmt.Fprintln(a.stdout, "No active sessions")
+		return 0
+	}
+	renderSessionsTable(a.stdout, sessions)
+	return 0
 }
 
 func (a *app) runKill(cmd parsedCommand) int {
@@ -849,7 +814,7 @@ func (a *app) runKill(cmd parsedCommand) int {
 	}
 	defer client.Close()
 
-	if err := client.CloseSession(ctx, cmd.connID, "kill requested by cli"); err != nil {
+	if err := client.CloseConn(ctx, cmd.connID, "kill requested by cli"); err != nil {
 		fmt.Fprintf(a.stderr, "elark: kill %s: %v\n", cmd.connID, err)
 		return 1
 	}
@@ -857,16 +822,37 @@ func (a *app) runKill(cmd parsedCommand) int {
 	return 0
 }
 
-func (a *app) daemonReachable(opts globalOptions, socketPath string) bool {
-	ctx, cancel := commandContext(opts)
-	defer cancel()
-
-	client, err := a.dial(ctx, socketPath)
-	if err != nil {
-		return false
+func renderSessionsTable(w io.Writer, sessions []ipc.SessionInfo) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "CONN_ID\tHOST\tSTATE\tSTARTED\tLAST_PEER")
+	for _, sess := range sessions {
+		state := strings.TrimSpace(sess.State)
+		if state == "" {
+			state = "open"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			sess.ConnID,
+			emptyDash(sess.Host),
+			state,
+			formatSessionTime(sess.StartedAt),
+			formatSessionTime(sess.LastPeerMessageAt),
+		)
 	}
-	_ = client.Close()
-	return true
+	_ = tw.Flush()
+}
+
+func formatSessionTime(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.Local().Format("2006-01-02 15:04:05")
+}
+
+func emptyDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
 }
 
 func commandContext(opts globalOptions) (context.Context, context.CancelFunc) {
@@ -874,26 +860,6 @@ func commandContext(opts globalOptions) (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), opts.timeout)
 	}
 	return context.WithCancel(context.Background())
-}
-
-func startDaemonProcess(ctx context.Context, configPath string, stdout, stderr io.Writer) error {
-	args := []string{"run"}
-	if strings.TrimSpace(configPath) != "" {
-		path, err := config.ResolvePath(configPath)
-		if err != nil {
-			return err
-		}
-		args = append(args, "--config", path)
-	}
-
-	cmd := exec.Command("elarkd", args...)
-	cmd.Stdin = nil
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	return nil
 }
 
 type ipcDaemonProbe struct {
@@ -1231,9 +1197,7 @@ func usage() string {
   elark [OPTIONS] hosts
   elark [OPTIONS] doctor
   elark [OPTIONS] sessions
-  elark [OPTIONS] attach <conn_id>
   elark [OPTIONS] kill <conn_id>
-  elark [OPTIONS] daemon start|status|stop
 
 Options:
   -t, --tty          allocate remote PTY
@@ -1243,5 +1207,6 @@ Options:
       --timeout DURATION
       --socket PATH  daemon Unix socket override
       --debug        include debug detail in local errors
+      --version      print elark version
 `
 }

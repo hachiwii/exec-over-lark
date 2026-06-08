@@ -164,6 +164,46 @@ func TestStartLocalSessionCreatesRootMessageAndSendsControls(t *testing.T) {
 	}
 }
 
+func TestLocalSessionsAndCloseConnUseConnID(t *testing.T) {
+	cfg := testLocalConfig(t)
+	fakeLark := &fakeLarkClient{botOpenID: "ou_self_bot", nextRootID: "om_root"}
+	local := newTestLocal(t, cfg, fakeLark)
+
+	if _, err := local.StartLocalSession(context.Background(), ipc.StartSessionRequest{
+		RequestID: "req-1",
+		Host:      "macmini",
+		Cmd:       "date",
+	}, &fakeSubscriber{}); err != nil {
+		t.Fatalf("StartLocalSession returned error: %v", err)
+	}
+
+	sessions, err := local.Sessions(context.Background(), ipc.SessionsRequest{RequestID: "sessions-1"})
+	if err != nil {
+		t.Fatalf("Sessions returned error: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ConnID != "om_root" || sessions[0].Host != "macmini" || sessions[0].State != "open" {
+		t.Fatalf("Sessions = %#v, want one open om_root session", sessions)
+	}
+
+	if err := local.CloseConn(context.Background(), ipc.CloseConnRequest{ConnID: "om_root", Reason: "kill requested by cli"}); err != nil {
+		t.Fatalf("CloseConn returned error: %v", err)
+	}
+	waitRepliesLen(t, fakeLark, 1)
+	reply := fakeLark.replies[0]
+	if reply.rootMessageID != "om_root" {
+		t.Fatalf("reply root = %q, want om_root", reply.rootMessageID)
+	}
+	frames := decodeFrames(t, reply.text)
+	assertFrame(t, frames[0], 2, protocol.TypeClose)
+	payload, err := protocol.DecodeJSONPayload[protocol.ClosePayload](frames[0])
+	if err != nil {
+		t.Fatalf("DecodeJSONPayload returned error: %v", err)
+	}
+	if payload.Reason != "kill requested by cli" {
+		t.Fatalf("close reason = %q, want kill requested by cli", payload.Reason)
+	}
+}
+
 func TestStartLocalSessionUsesHostConfigFromIPCRequest(t *testing.T) {
 	cfg := testLocalConfig(t)
 	fakeLark := &fakeLarkClient{botOpenID: "ou_self_bot", nextRootID: "om_root"}

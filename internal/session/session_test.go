@@ -99,6 +99,36 @@ func TestLocalPeerTimeoutUseFakeClock(t *testing.T) {
 	}
 }
 
+func TestCloseLocalByConnSendsCloseFrame(t *testing.T) {
+	out := newFakeOutbound()
+	manager := New(WithOutbound(out))
+	if err := manager.RegisterLocal(LocalStart{
+		RequestID:     "req-1",
+		Host:          "macmini",
+		RootMessageID: "om_root",
+		ChatID:        "oc_chat",
+		PeerBotOpenID: "ou_server",
+	}, &fakeSubscriber{}); err != nil {
+		t.Fatalf("RegisterLocal returned error: %v", err)
+	}
+
+	if err := manager.CloseLocalByConn(context.Background(), "om_root", "kill requested by cli"); err != nil {
+		t.Fatalf("CloseLocalByConn returned error: %v", err)
+	}
+	if len(out.items) != 1 {
+		t.Fatalf("queued frames = %d, want close", len(out.items))
+	}
+	assertFrame(t, out.items[0].frames[0], 2, protocol.TypeClose)
+	payload, err := protocol.DecodeJSONPayload[protocol.ClosePayload](out.items[0].frames[0])
+	if err != nil {
+		t.Fatalf("DecodeJSONPayload returned error: %v", err)
+	}
+	if payload.Reason != "kill requested by cli" {
+		t.Fatalf("close reason = %q, want kill requested by cli", payload.Reason)
+	}
+	waitLocalSessionsLen(t, manager, 0)
+}
+
 func TestLocalReceiveWindowGapTimeoutDeliversErrorAndCleansUp(t *testing.T) {
 	clock := newFakeClock()
 	out := newFakeOutbound()
@@ -460,6 +490,23 @@ func waitRemoteSessionsLen(t *testing.T, manager *Manager, want int) {
 		select {
 		case <-deadline:
 			t.Fatalf("RemoteSessions did not become %d, got %d", want, len(manager.RemoteSessions()))
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitLocalSessionsLen(t *testing.T, manager *Manager, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := len(manager.LocalSessions()); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("LocalSessions did not become %d, got %d", want, len(manager.LocalSessions()))
 		case <-ticker.C:
 		}
 	}

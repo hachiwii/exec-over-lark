@@ -15,7 +15,25 @@ import (
 	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
+	"github.com/hachiwii/exec-over-lark/internal/version"
 )
+
+func TestVersionOptionPrintsVersion(t *testing.T) {
+	oldVersion := version.Version
+	version.Version = "v9.8.7-test"
+	t.Cleanup(func() {
+		version.Version = oldVersion
+	})
+
+	app, stdout, stderr := newTestApp(nil, nil)
+	code := app.run([]string{"--version"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "v9.8.7-test" {
+		t.Fatalf("stdout = %q, want version", stdout.String())
+	}
+}
 
 func TestHostCommandUsesNonPTYByDefault(t *testing.T) {
 	fake := &fakeClient{
@@ -373,22 +391,6 @@ func TestDaemonUnavailablePrompt(t *testing.T) {
 	}
 }
 
-func TestDaemonStatusUsesFakeDial(t *testing.T) {
-	fake := &fakeClient{}
-	app, stdout, stderr := newTestApp(fake, nil)
-
-	code := app.run([]string{"--socket", "/tmp/elarkd.sock", "daemon", "status"})
-	if code != 0 {
-		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "running") {
-		t.Fatalf("stdout = %q, want running status", stdout.String())
-	}
-	if !fake.closed {
-		t.Fatal("daemon status should close the client after probing")
-	}
-}
-
 func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 	dir := shortTempDir(t)
 	writeCLIConfig(t, dir, "never-print-me")
@@ -450,6 +452,48 @@ func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 	})
 }
 
+func TestSessionsRendersTable(t *testing.T) {
+	fake := &fakeClient{
+		sessions: []ipc.SessionInfo{{
+			ConnID:            "om_root",
+			Host:              "macmini",
+			StartedAt:         time.Date(2026, 6, 8, 10, 0, 0, 0, time.Local),
+			LastPeerMessageAt: time.Date(2026, 6, 8, 10, 1, 0, 0, time.Local),
+			State:             "open",
+		}},
+	}
+	app, stdout, stderr := newTestApp(fake, nil)
+
+	code := app.run([]string{"--socket", "/tmp/elarkd.sock", "sessions"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"CONN_ID", "HOST", "STATE", "STARTED", "LAST_PEER", "om_root", "macmini", "open"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout = %q, want %q", out, want)
+		}
+	}
+	if strings.Contains(out, "REQUEST") || strings.Contains(out, "req-") {
+		t.Fatalf("stdout leaked request id surface: %q", out)
+	}
+	if !fake.closed {
+		t.Fatal("sessions should close the client")
+	}
+}
+
+func TestSessionsEmpty(t *testing.T) {
+	app, stdout, stderr := newTestApp(&fakeClient{}, nil)
+
+	code := app.run([]string{"--socket", "/tmp/elarkd.sock", "sessions"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "No active sessions" {
+		t.Fatalf("stdout = %q, want no sessions message", stdout.String())
+	}
+}
+
 func TestKillSendsCloseRequest(t *testing.T) {
 	fake := &fakeClient{}
 	app, stdout, stderr := newTestApp(fake, nil)
@@ -458,34 +502,39 @@ func TestKillSendsCloseRequest(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
-	if len(fake.closes) != 1 || fake.closes[0] != "om_conn" {
-		t.Fatalf("close requests = %#v, want om_conn", fake.closes)
+	if len(fake.closeConns) != 1 || fake.closeConns[0] != "om_conn" {
+		t.Fatalf("close_conn requests = %#v, want om_conn", fake.closeConns)
+	}
+	if len(fake.closes) != 0 {
+		t.Fatalf("request_id close requests = %#v, want none", fake.closes)
 	}
 	if !strings.Contains(stdout.String(), "om_conn") {
 		t.Fatalf("stdout = %q, want conn id", stdout.String())
 	}
 }
 
-func TestUnsupportedControlSurfacesAreWired(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "sessions", args: []string{"sessions"}, want: "sessions RPC"},
-		{name: "attach", args: []string{"attach", "om_conn"}, want: "attach RPC"},
-		{name: "daemon stop", args: []string{"--socket", "/tmp/elarkd.sock", "daemon", "stop"}, want: "control RPC"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			app, _, stderr := newTestApp(&fakeClient{}, nil)
-			code := app.run(tc.args)
-			if code != 1 {
-				t.Fatalf("exit code = %d, want 1", code)
-			}
-			if !strings.Contains(stderr.String(), tc.want) {
-				t.Fatalf("stderr = %q, want %q", stderr.String(), tc.want)
-			}
-		})
+func TestRemovedCommandsAreNotSpecialCommands(t *testing.T) {
+	text := usage()
+	for _, removed := range []string{"attach <conn_id>", "daemon start"} {
+		if strings.Contains(text, removed) {
+			t.Fatalf("usage still contains removed command %q:\n%s", removed, text)
+		}
+	}
+
+	attach, err := parseArgs([]string{"attach", "om_conn"})
+	if err != nil {
+		t.Fatalf("parse attach returned error: %v", err)
+	}
+	if attach.kind != commandRemote || attach.host != "attach" || attach.command != "om_conn" {
+		t.Fatalf("attach parse = %#v, want normal remote command", attach)
+	}
+
+	daemon, err := parseArgs([]string{"daemon", "status"})
+	if err != nil {
+		t.Fatalf("parse daemon returned error: %v", err)
+	}
+	if daemon.kind != commandRemote || daemon.host != "daemon" || daemon.command != "status" {
+		t.Fatalf("daemon parse = %#v, want normal remote command", daemon)
 	}
 }
 
@@ -497,11 +546,10 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 	}
 	dialer := &recordingDialer{client: client}
 	return &app{
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		dial:        dialer.dial,
-		startDaemon: func(context.Context, string, io.Writer, io.Writer) error { return nil },
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+		dial:   dialer.dial,
 		getenv: func(key string) string {
 			switch key {
 			case "LINES":
@@ -590,9 +638,11 @@ type fakeClient struct {
 	resizes        [][2]int
 	signals        []string
 	closes         []string
+	closeConns     []string
 	messages       []ipc.Message
 	receiveCh      chan ipc.Message
 	status         ipc.DaemonStatus
+	sessions       []ipc.SessionInfo
 	statusRequests []ipc.StatusRequest
 	closed         bool
 
@@ -640,12 +690,21 @@ func (f *fakeClient) CloseSession(ctx context.Context, requestID, reason string)
 	return nil
 }
 
+func (f *fakeClient) CloseConn(ctx context.Context, connID, reason string) error {
+	f.closeConns = append(f.closeConns, connID)
+	return nil
+}
+
 func (f *fakeClient) Status(ctx context.Context, req ipc.StatusRequest) (ipc.DaemonStatus, error) {
 	f.statusRequests = append(f.statusRequests, req)
 	if !f.status.Running && !f.status.Event.Checked && !f.status.Outbound.Checked {
 		return ipc.DaemonStatus{Running: true}, nil
 	}
 	return f.status, nil
+}
+
+func (f *fakeClient) Sessions(ctx context.Context, req ipc.SessionsRequest) ([]ipc.SessionInfo, error) {
+	return append([]ipc.SessionInfo(nil), f.sessions...), nil
 }
 
 func (f *fakeClient) Receive(ctx context.Context) (ipc.Message, error) {

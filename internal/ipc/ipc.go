@@ -36,14 +36,17 @@ const (
 	TypeResize       MessageType = "resize"
 	TypeSignal       MessageType = "signal"
 	TypeClose        MessageType = "close"
+	TypeCloseConn    MessageType = "close_conn"
 	TypeStatus       MessageType = "status"
+	TypeSessions     MessageType = "sessions"
 
-	TypeStartAck     MessageType = "start_ack"
-	TypeStdout       MessageType = "stdout"
-	TypeStderr       MessageType = "stderr"
-	TypeExit         MessageType = "exit"
-	TypeStatusResult MessageType = "status_result"
-	TypeError        MessageType = "error"
+	TypeStartAck       MessageType = "start_ack"
+	TypeStdout         MessageType = "stdout"
+	TypeStderr         MessageType = "stderr"
+	TypeExit           MessageType = "exit"
+	TypeStatusResult   MessageType = "status_result"
+	TypeSessionsResult MessageType = "sessions_result"
+	TypeError          MessageType = "error"
 )
 
 const (
@@ -60,6 +63,7 @@ const (
 type Message struct {
 	Type       MessageType       `json:"type"`
 	RequestID  string            `json:"request_id,omitempty"`
+	ConnID     string            `json:"conn_id,omitempty"`
 	Host       string            `json:"host,omitempty"`
 	HostConfig *HostConfig       `json:"host_config,omitempty"`
 	ConfigPath string            `json:"config_path,omitempty"`
@@ -81,6 +85,7 @@ type Message struct {
 	Detail    string `json:"detail,omitempty"`
 
 	DaemonStatus *DaemonStatus `json:"daemon_status,omitempty"`
+	Sessions     []SessionInfo `json:"sessions,omitempty"`
 
 	Bytes []byte `json:"-"`
 }
@@ -88,6 +93,7 @@ type Message struct {
 type messageHeader struct {
 	Type         MessageType       `json:"type"`
 	RequestID    string            `json:"request_id,omitempty"`
+	ConnID       string            `json:"conn_id,omitempty"`
 	Host         string            `json:"host,omitempty"`
 	HostConfig   *HostConfig       `json:"host_config,omitempty"`
 	ConfigPath   string            `json:"config_path,omitempty"`
@@ -107,6 +113,7 @@ type messageHeader struct {
 	Message      string            `json:"message,omitempty"`
 	Detail       string            `json:"detail,omitempty"`
 	DaemonStatus *DaemonStatus     `json:"daemon_status,omitempty"`
+	Sessions     []SessionInfo     `json:"sessions,omitempty"`
 	BytesLen     int               `json:"bytes_len,omitempty"`
 }
 
@@ -153,12 +160,29 @@ type CloseRequest struct {
 	Reason    string
 }
 
+type CloseConnRequest struct {
+	ConnID string
+	Reason string
+}
+
 type StatusRequest struct {
 	RequestID  string
 	ConfigPath string
 	SocketPath string
 	Host       string
 	NodeName   string
+}
+
+type SessionsRequest struct {
+	RequestID string
+}
+
+type SessionInfo struct {
+	ConnID            string    `json:"conn_id"`
+	Host              string    `json:"host,omitempty"`
+	StartedAt         time.Time `json:"started_at,omitempty"`
+	LastPeerMessageAt time.Time `json:"last_peer_message_at,omitempty"`
+	State             string    `json:"state,omitempty"`
 }
 
 type DaemonStatus struct {
@@ -203,7 +227,9 @@ type Handler interface {
 	Resize(context.Context, ResizeRequest) error
 	Signal(context.Context, SignalRequest) error
 	Close(context.Context, CloseRequest) error
+	CloseConn(context.Context, CloseConnRequest) error
 	Status(context.Context, StatusRequest) (DaemonStatus, error)
+	Sessions(context.Context, SessionsRequest) ([]SessionInfo, error)
 }
 
 // HandlerFuncs lets tests and small integrations implement Handler without a
@@ -214,7 +240,9 @@ type HandlerFuncs struct {
 	ResizeFunc       func(context.Context, ResizeRequest) error
 	SignalFunc       func(context.Context, SignalRequest) error
 	CloseFunc        func(context.Context, CloseRequest) error
+	CloseConnFunc    func(context.Context, CloseConnRequest) error
 	StatusFunc       func(context.Context, StatusRequest) (DaemonStatus, error)
+	SessionsFunc     func(context.Context, SessionsRequest) ([]SessionInfo, error)
 }
 
 func (h HandlerFuncs) StartSession(ctx context.Context, sess *Session, req StartSessionRequest) error {
@@ -252,11 +280,25 @@ func (h HandlerFuncs) Close(ctx context.Context, req CloseRequest) error {
 	return h.CloseFunc(ctx, req)
 }
 
+func (h HandlerFuncs) CloseConn(ctx context.Context, req CloseConnRequest) error {
+	if h.CloseConnFunc == nil {
+		return nil
+	}
+	return h.CloseConnFunc(ctx, req)
+}
+
 func (h HandlerFuncs) Status(ctx context.Context, req StatusRequest) (DaemonStatus, error) {
 	if h.StatusFunc == nil {
 		return DaemonStatus{Running: true}, nil
 	}
 	return h.StatusFunc(ctx, req)
+}
+
+func (h HandlerFuncs) Sessions(ctx context.Context, req SessionsRequest) ([]SessionInfo, error) {
+	if h.SessionsFunc == nil {
+		return nil, nil
+	}
+	return h.SessionsFunc(ctx, req)
 }
 
 // RPCError is the stable error envelope used on the wire for TypeError.
@@ -355,8 +397,16 @@ func StatusMessage(req StatusRequest) Message {
 	}
 }
 
+func SessionsMessage(req SessionsRequest) Message {
+	return Message{Type: TypeSessions, RequestID: req.RequestID}
+}
+
 func StatusResultMessage(requestID string, status DaemonStatus) Message {
 	return Message{Type: TypeStatusResult, RequestID: requestID, DaemonStatus: cloneDaemonStatus(status)}
+}
+
+func SessionsResultMessage(requestID string, sessions []SessionInfo) Message {
+	return Message{Type: TypeSessionsResult, RequestID: requestID, Sessions: cloneSessions(sessions)}
 }
 
 func StdinMessage(requestID string, data []byte) Message {
@@ -373,6 +423,10 @@ func SignalMessage(requestID, name string) Message {
 
 func CloseMessage(requestID, reason string) Message {
 	return Message{Type: TypeClose, RequestID: requestID, Reason: reason}
+}
+
+func CloseConnMessage(connID, reason string) Message {
+	return Message{Type: TypeCloseConn, ConnID: connID, Reason: reason}
 }
 
 func StdoutMessage(requestID string, data []byte) Message {
@@ -570,6 +624,10 @@ func (c *Client) CloseSession(ctx context.Context, requestID, reason string) err
 	return c.conn.Write(ctx, CloseMessage(requestID, reason))
 }
 
+func (c *Client) CloseConn(ctx context.Context, connID, reason string) error {
+	return c.conn.Write(ctx, CloseConnMessage(connID, reason))
+}
+
 func (c *Client) Cancel(ctx context.Context, requestID, reason string) error {
 	return c.CloseSession(ctx, requestID, reason)
 }
@@ -603,6 +661,32 @@ func (c *Client) Status(ctx context.Context, req StatusRequest) (DaemonStatus, e
 			return DaemonStatus{}, msg.AsError()
 		default:
 			return DaemonStatus{}, fmt.Errorf("%w: unexpected status response type %q", ErrInvalidMessage, msg.Type)
+		}
+	}
+}
+
+func (c *Client) Sessions(ctx context.Context, req SessionsRequest) ([]SessionInfo, error) {
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = fmt.Sprintf("sessions-%d", time.Now().UnixNano())
+	}
+	if err := c.conn.Write(ctx, SessionsMessage(req)); err != nil {
+		return nil, err
+	}
+	for {
+		msg, err := c.Receive(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if msg.RequestID != "" && msg.RequestID != req.RequestID {
+			continue
+		}
+		switch msg.Type {
+		case TypeSessionsResult:
+			return cloneSessions(msg.Sessions), nil
+		case TypeError:
+			return nil, msg.AsError()
+		default:
+			return nil, fmt.Errorf("%w: unexpected sessions response type %q", ErrInvalidMessage, msg.Type)
 		}
 	}
 }
@@ -779,6 +863,8 @@ func (s *Server) dispatch(ctx context.Context, session *Session, msg Message) er
 		return s.handler.Signal(ctx, SignalRequest{RequestID: msg.RequestID, Name: msg.Name})
 	case TypeClose:
 		return s.handler.Close(ctx, CloseRequest{RequestID: msg.RequestID, Reason: msg.Reason})
+	case TypeCloseConn:
+		return s.handler.CloseConn(ctx, CloseConnRequest{ConnID: msg.ConnID, Reason: msg.Reason})
 	case TypeStatus:
 		status, err := s.handler.Status(ctx, StatusRequest{
 			RequestID:  msg.RequestID,
@@ -791,6 +877,12 @@ func (s *Server) dispatch(ctx context.Context, session *Session, msg Message) er
 			return err
 		}
 		return session.conn.Write(ctx, StatusResultMessage(msg.RequestID, status))
+	case TypeSessions:
+		sessions, err := s.handler.Sessions(ctx, SessionsRequest{RequestID: msg.RequestID})
+		if err != nil {
+			return err
+		}
+		return session.conn.Write(ctx, SessionsResultMessage(msg.RequestID, sessions))
 	default:
 		return NewRPCError(ErrorCodeBadRequest, "unsupported client message type", string(msg.Type))
 	}
@@ -817,6 +909,7 @@ func (m Message) toHeader() messageHeader {
 	return messageHeader{
 		Type:         m.Type,
 		RequestID:    m.RequestID,
+		ConnID:       m.ConnID,
 		Host:         m.Host,
 		HostConfig:   cloneHostConfigPtr(m.HostConfig),
 		ConfigPath:   m.ConfigPath,
@@ -836,6 +929,7 @@ func (m Message) toHeader() messageHeader {
 		Message:      m.Message,
 		Detail:       m.Detail,
 		DaemonStatus: cloneDaemonStatusPtr(m.DaemonStatus),
+		Sessions:     cloneSessions(m.Sessions),
 	}
 }
 
@@ -843,6 +937,7 @@ func messageFromHeader(h messageHeader) Message {
 	return Message{
 		Type:         h.Type,
 		RequestID:    h.RequestID,
+		ConnID:       h.ConnID,
 		Host:         h.Host,
 		HostConfig:   cloneHostConfigPtr(h.HostConfig),
 		ConfigPath:   h.ConfigPath,
@@ -862,6 +957,7 @@ func messageFromHeader(h messageHeader) Message {
 		Message:      h.Message,
 		Detail:       h.Detail,
 		DaemonStatus: cloneDaemonStatusPtr(h.DaemonStatus),
+		Sessions:     cloneSessions(h.Sessions),
 	}
 }
 
@@ -902,9 +998,17 @@ func (m Message) validate(maxPayloadBytes int) error {
 		if strings.TrimSpace(m.RequestID) == "" {
 			return fmt.Errorf("%w: close request_id is required", ErrInvalidMessage)
 		}
+	case TypeCloseConn:
+		if strings.TrimSpace(m.ConnID) == "" {
+			return fmt.Errorf("%w: close_conn conn_id is required", ErrInvalidMessage)
+		}
 	case TypeStatus:
 		if strings.TrimSpace(m.RequestID) == "" {
 			return fmt.Errorf("%w: status request_id is required", ErrInvalidMessage)
+		}
+	case TypeSessions:
+		if strings.TrimSpace(m.RequestID) == "" {
+			return fmt.Errorf("%w: sessions request_id is required", ErrInvalidMessage)
 		}
 	case TypeStartAck, TypeExit:
 		if strings.TrimSpace(m.RequestID) == "" {
@@ -916,6 +1020,15 @@ func (m Message) validate(maxPayloadBytes int) error {
 		}
 		if m.DaemonStatus == nil {
 			return fmt.Errorf("%w: status_result daemon_status is required", ErrInvalidMessage)
+		}
+	case TypeSessionsResult:
+		if strings.TrimSpace(m.RequestID) == "" {
+			return fmt.Errorf("%w: sessions_result request_id is required", ErrInvalidMessage)
+		}
+		for i, sess := range m.Sessions {
+			if strings.TrimSpace(sess.ConnID) == "" {
+				return fmt.Errorf("%w: sessions_result sessions[%d].conn_id is required", ErrInvalidMessage, i)
+			}
 		}
 	case TypeError:
 		if strings.TrimSpace(m.ErrorCode) == "" {
@@ -1079,6 +1192,13 @@ func cloneDaemonStatusValue(in *DaemonStatus) DaemonStatus {
 		out.Outbound.PendingTargets = append([]OutboundTarget(nil), in.Outbound.PendingTargets...)
 	}
 	return out
+}
+
+func cloneSessions(in []SessionInfo) []SessionInfo {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]SessionInfo(nil), in...)
 }
 
 func firstNonEmpty(values ...string) string {
