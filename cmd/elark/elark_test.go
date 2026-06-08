@@ -216,6 +216,46 @@ func TestInteractivePTYStreamsTerminalStdin(t *testing.T) {
 	receiveClosed(t, rawState.restored)
 }
 
+func TestInteractivePTYNormalizesBackspaceAndBatchesEscapeSequence(t *testing.T) {
+	stdin := newChunkedReader()
+	fake := &fakeClient{
+		receiveCh: make(chan ipc.Message, 2),
+		startCh:   make(chan ipc.StartSessionRequest, 1),
+		stdinCh:   make(chan []byte, 1),
+	}
+	app, _, stderr := newTestApp(fake, stdin)
+	app.stdinIsTerminal = func(io.Reader) bool { return true }
+	rawState := &fakeTerminalState{restored: make(chan struct{}, 1)}
+	app.makeRawTerminal = func(io.Reader) (terminalRestorer, error) {
+		return rawState, nil
+	}
+	configPath := testCLIConfigPath(t)
+
+	codeCh := make(chan int, 1)
+	go func() {
+		codeCh <- app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini"})
+	}()
+
+	receiveStart(t, fake.startCh)
+	fake.receiveCh <- ipc.StartAckMessage("")
+
+	stdin.write([]byte{'a'})
+	stdin.write([]byte{0x08})
+	stdin.write([]byte{0x1b})
+	stdin.write([]byte{'[', 'D'})
+	stdin.close()
+
+	if got := receiveBytes(t, fake.stdinCh); !bytes.Equal(got, []byte{'a', 0x7f, 0x1b, '[', 'D'}) {
+		t.Fatalf("forwarded stdin = % x, want normalized batched bytes", got)
+	}
+
+	fake.receiveCh <- ipc.ExitMessage("", 0)
+	if code := receiveExitCode(t, codeCh); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	receiveClosed(t, rawState.restored)
+}
+
 func TestInterruptClosesNonPTYSession(t *testing.T) {
 	fake := &fakeClient{
 		closeSessionCh: make(chan string, 1),
@@ -488,6 +528,30 @@ func (s *fakeTerminalState) Restore() error {
 		s.restored <- struct{}{}
 	}
 	return nil
+}
+
+type chunkedReader struct {
+	ch chan []byte
+}
+
+func newChunkedReader() *chunkedReader {
+	return &chunkedReader{ch: make(chan []byte, 8)}
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	chunk, ok := <-r.ch
+	if !ok {
+		return 0, io.EOF
+	}
+	return copy(p, chunk), nil
+}
+
+func (r *chunkedReader) write(data []byte) {
+	r.ch <- append([]byte(nil), data...)
+}
+
+func (r *chunkedReader) close() {
+	close(r.ch)
 }
 
 type fakeSignalNotify struct {
