@@ -171,6 +171,51 @@ func TestSendsPipedStdin(t *testing.T) {
 	}
 }
 
+func TestInteractivePTYStreamsTerminalStdin(t *testing.T) {
+	stdinReader, stdinWriter := io.Pipe()
+	defer stdinWriter.Close()
+	fake := &fakeClient{
+		receiveCh: make(chan ipc.Message, 2),
+		startCh:   make(chan ipc.StartSessionRequest, 1),
+		stdinCh:   make(chan []byte, 1),
+	}
+	app, _, stderr := newTestApp(fake, stdinReader)
+	app.stdinIsTerminal = func(io.Reader) bool { return true }
+	rawState := &fakeTerminalState{restored: make(chan struct{}, 1)}
+	rawCh := make(chan struct{}, 1)
+	app.makeRawTerminal = func(io.Reader) (terminalRestorer, error) {
+		rawCh <- struct{}{}
+		return rawState, nil
+	}
+	configPath := testCLIConfigPath(t)
+
+	codeCh := make(chan int, 1)
+	go func() {
+		codeCh <- app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini"})
+	}()
+
+	start := receiveStart(t, fake.startCh)
+	if !start.Pty || start.Cmd != "" {
+		t.Fatalf("start request = %#v, want interactive PTY", start)
+	}
+	fake.receiveCh <- ipc.StartAckMessage("")
+	receiveRawMode(t, rawCh)
+
+	if _, err := stdinWriter.Write([]byte("pwd\n")); err != nil {
+		t.Fatalf("write test stdin: %v", err)
+	}
+	if got := receiveBytes(t, fake.stdinCh); string(got) != "pwd\n" {
+		t.Fatalf("forwarded stdin = %q, want pwd newline", got)
+	}
+
+	_ = stdinWriter.Close()
+	fake.receiveCh <- ipc.ExitMessage("", 0)
+	if code := receiveExitCode(t, codeCh); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	receiveClosed(t, rawState.restored)
+}
+
 func TestInterruptClosesNonPTYSession(t *testing.T) {
 	fake := &fakeClient{
 		closeSessionCh: make(chan string, 1),
@@ -429,7 +474,20 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 		},
 		notifySignals:    func(chan<- os.Signal, ...os.Signal) {},
 		stopSignalNotify: func(chan<- os.Signal) {},
+		stdinIsTerminal:  stdinIsTerminal,
+		makeRawTerminal:  makeRawTerminal,
 	}, stdout, stderr
+}
+
+type fakeTerminalState struct {
+	restored chan struct{}
+}
+
+func (s *fakeTerminalState) Restore() error {
+	if s.restored != nil {
+		s.restored <- struct{}{}
+	}
+	return nil
 }
 
 type fakeSignalNotify struct {
@@ -469,10 +527,13 @@ type fakeClient struct {
 	signals        []string
 	closes         []string
 	messages       []ipc.Message
+	receiveCh      chan ipc.Message
 	status         ipc.DaemonStatus
 	statusRequests []ipc.StatusRequest
 	closed         bool
 
+	startCh        chan ipc.StartSessionRequest
+	stdinCh        chan []byte
 	closeSessionCh chan string
 	signalCh       chan string
 	clientClosedCh chan struct{}
@@ -480,11 +541,17 @@ type fakeClient struct {
 
 func (f *fakeClient) StartSession(ctx context.Context, req ipc.StartSessionRequest) error {
 	f.starts = append(f.starts, req)
+	if f.startCh != nil {
+		f.startCh <- req
+	}
 	return nil
 }
 
 func (f *fakeClient) SendStdin(ctx context.Context, requestID string, data []byte) error {
 	f.stdin = append(f.stdin, append([]byte(nil), data...))
+	if f.stdinCh != nil {
+		f.stdinCh <- append([]byte(nil), data...)
+	}
 	return nil
 }
 
@@ -518,6 +585,17 @@ func (f *fakeClient) Status(ctx context.Context, req ipc.StatusRequest) (ipc.Dae
 }
 
 func (f *fakeClient) Receive(ctx context.Context) (ipc.Message, error) {
+	if f.receiveCh != nil {
+		select {
+		case <-ctx.Done():
+			return ipc.Message{}, ctx.Err()
+		case msg := <-f.receiveCh:
+			if msg.RequestID == "" && len(f.starts) > 0 {
+				msg.RequestID = f.starts[len(f.starts)-1].RequestID
+			}
+			return msg, nil
+		}
+	}
 	if len(f.messages) == 0 {
 		return ipc.Message{}, errors.New("no fake message")
 	}
@@ -556,6 +634,48 @@ func receiveString(t *testing.T, ch <-chan string) string {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for string")
 		return ""
+	}
+}
+
+func receiveBytes(t *testing.T, ch <-chan []byte) []byte {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bytes")
+		return nil
+	}
+}
+
+func receiveStart(t *testing.T, ch <-chan ipc.StartSessionRequest) ipc.StartSessionRequest {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for start")
+		return ipc.StartSessionRequest{}
+	}
+}
+
+func receiveExitCode(t *testing.T, ch <-chan int) int {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for exit code")
+		return 0
+	}
+}
+
+func receiveRawMode(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for raw mode")
 	}
 }
 

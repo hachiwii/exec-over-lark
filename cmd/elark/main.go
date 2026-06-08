@@ -24,6 +24,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
+	"github.com/hachiwii/exec-over-lark/internal/pty"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -46,6 +47,10 @@ type daemonClient interface {
 
 type dialFunc func(context.Context, string) (daemonClient, error)
 type daemonStarter func(context.Context, string, io.Writer, io.Writer) error
+type terminalRestorer interface {
+	Restore() error
+}
+type makeRawFunc func(io.Reader) (terminalRestorer, error)
 
 type app struct {
 	stdin  io.Reader
@@ -56,6 +61,8 @@ type app struct {
 	startDaemon daemonStarter
 	getenv      func(string) string
 
+	stdinIsTerminal  func(io.Reader) bool
+	makeRawTerminal  makeRawFunc
 	notifySignals    func(chan<- os.Signal, ...os.Signal)
 	stopSignalNotify func(chan<- os.Signal)
 }
@@ -125,6 +132,8 @@ func newApp() *app {
 		dial:             dialIPC,
 		startDaemon:      startDaemonProcess,
 		getenv:           os.Getenv,
+		stdinIsTerminal:  stdinIsTerminal,
+		makeRawTerminal:  makeRawTerminal,
 		notifySignals:    signal.Notify,
 		stopSignalNotify: signal.Stop,
 	}
@@ -383,7 +392,26 @@ func (a *app) runRemote(cmd parsedCommand) int {
 	signals := a.forwardSignals(ctx, cancel, client, requestID, start.Pty, startAcked)
 	defer signals.stop()
 
-	if shouldReadStdin(a.stdin) {
+	terminalStdin := start.Pty && a.isStdinTerminal()
+	var restoreTerminal func()
+	defer func() {
+		if restoreTerminal != nil {
+			restoreTerminal()
+		}
+	}()
+	startRawForwarding := func() error {
+		if !terminalStdin || restoreTerminal != nil {
+			return nil
+		}
+		restore, err := a.forwardRawTerminalStdin(ctx, client, requestID)
+		if err != nil {
+			return err
+		}
+		restoreTerminal = restore
+		return nil
+	}
+
+	if !terminalStdin && shouldReadStdin(a.stdin) {
 		data, err := io.ReadAll(a.stdin)
 		if err != nil {
 			fmt.Fprintf(a.stderr, "elark: read stdin: %v\n", err)
@@ -415,6 +443,13 @@ func (a *app) runRemote(cmd parsedCommand) int {
 		switch msg.Type {
 		case ipc.TypeStartAck:
 			markStartAck()
+			if err := startRawForwarding(); err != nil {
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), clientInterruptCloseTimeout)
+				_ = client.CloseSession(closeCtx, requestID, "local terminal setup failed")
+				closeCancel()
+				fmt.Fprintf(a.stderr, "elark: prepare terminal: %v\n", err)
+				return 1
+			}
 		case ipc.TypeStdout:
 			if _, err := a.stdout.Write(msg.Bytes); err != nil {
 				fmt.Fprintf(a.stderr, "elark: write stdout: %v\n", err)
@@ -521,6 +556,50 @@ func (a *app) forwardSignals(ctx context.Context, cancel context.CancelFunc, cli
 			close(done)
 		},
 	}
+}
+
+func (a *app) isStdinTerminal() bool {
+	if a.stdinIsTerminal != nil {
+		return a.stdinIsTerminal(a.stdin)
+	}
+	return stdinIsTerminal(a.stdin)
+}
+
+func (a *app) forwardRawTerminalStdin(ctx context.Context, client daemonClient, requestID string) (func(), error) {
+	makeRaw := a.makeRawTerminal
+	if makeRaw == nil {
+		makeRaw = makeRawTerminal
+	}
+	state, err := makeRaw(a.stdin)
+	if err != nil {
+		return nil, err
+	}
+	var restoreOnce sync.Once
+	restore := func() {
+		restoreOnce.Do(func() {
+			_ = state.Restore()
+		})
+	}
+
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := a.stdin.Read(buf)
+			if n > 0 {
+				data := append([]byte(nil), buf[:n]...)
+				if ctx.Err() != nil {
+					return
+				}
+				if sendErr := client.SendStdin(ctx, requestID, data); sendErr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return restore, nil
 }
 
 func shouldCloseOnInterrupt(pty bool, startAcked <-chan struct{}) bool {
@@ -1008,6 +1087,22 @@ func shouldReadStdin(r io.Reader) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice == 0
+}
+
+func stdinIsTerminal(r io.Reader) bool {
+	file, ok := r.(*os.File)
+	if !ok {
+		return false
+	}
+	return pty.IsTerminal(int(file.Fd()))
+}
+
+func makeRawTerminal(r io.Reader) (terminalRestorer, error) {
+	file, ok := r.(*os.File)
+	if !ok {
+		return nil, errors.New("stdin is not a terminal file")
+	}
+	return pty.MakeRaw(int(file.Fd()))
 }
 
 func terminalSizeFromEnv(getenv func(string) string) (int, int) {
