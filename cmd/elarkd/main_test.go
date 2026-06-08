@@ -9,9 +9,10 @@ import (
 
 	"github.com/hachiwii/exec-over-lark/internal/daemon"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
+	"github.com/hachiwii/exec-over-lark/internal/version"
 )
 
-func TestHelpIncludesInitCommand(t *testing.T) {
+func TestHelpIncludesAllCommandsAndGlobalOptions(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := run([]string{"--help"}, &stdout, &stderr)
@@ -20,19 +21,54 @@ func TestHelpIncludesInitCommand(t *testing.T) {
 	}
 	output := stdout.String() + stderr.String()
 	for _, want := range []string{
+		"elarkd [--config PATH]",
+		"elarkd [--help|--version]",
 		"elarkd run [--config PATH]",
 		"elarkd init (--client|--server)",
 		"elarkd install [--config PATH] [--system]",
-		"elarkd status [--system]",
+		"elarkd uninstall [--config PATH] [--system]",
+		"elarkd start [--config PATH] [--system]",
+		"elarkd restart [--config PATH] [--system]",
+		"elarkd stop [--config PATH] [--system]",
+		"elarkd status [--config PATH] [--system]",
 		"elarkd doctor [--config PATH]",
+		"elarkd help",
 		"Commands:",
 		"run        run elarkd in the foreground",
 		"init       write a client or server config template",
+		"install    install the background daemon service",
+		"uninstall  remove the installed daemon service",
+		"start      start the installed daemon service",
+		"restart    restart the installed daemon service",
+		"stop       stop the installed daemon service",
 		"status     show the installed daemon service status",
+		"doctor     check config validity and Lark token refresh",
+		"help       show this help",
+		"--version",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("help output = %q, want %q", output, want)
 		}
+	}
+}
+
+func TestVersionOptionPrintsVersion(t *testing.T) {
+	oldVersion := version.Version
+	version.Version = "v9.8.7-test"
+	t.Cleanup(func() {
+		version.Version = oldVersion
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--version"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "v9.8.7-test" {
+		t.Fatalf("stdout = %q, want version", stdout.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/daemon"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
+	"github.com/hachiwii/exec-over-lark/internal/version"
 )
 
 func main() {
@@ -29,6 +30,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "-h", "--help", "help":
 		printUsage(stdout)
+		return 0
+	case "--version":
+		fmt.Fprintln(stdout, version.String())
 		return 0
 	case "run":
 		return runForeground(args[1:], stdout, stderr)
@@ -279,15 +283,18 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
+  elarkd [--config PATH]
+  elarkd [--help|--version]
   elarkd run [--config PATH]
   elarkd init (--client|--server) [--config PATH] [--force]
   elarkd install [--config PATH] [--system]
-  elarkd uninstall [--system]
-  elarkd start [--system]
-  elarkd restart [--system]
-  elarkd stop [--system]
-  elarkd status [--system]
+  elarkd uninstall [--config PATH] [--system]
+  elarkd start [--config PATH] [--system]
+  elarkd restart [--config PATH] [--system]
+  elarkd stop [--config PATH] [--system]
+  elarkd status [--config PATH] [--system]
   elarkd doctor [--config PATH]
+  elarkd help
 
 Commands:
   run        run elarkd in the foreground
@@ -299,9 +306,13 @@ Commands:
   stop       stop the installed daemon service
   status     show the installed daemon service status
   doctor     check config validity and Lark token refresh
+  help       show this help
 
 Options:
+  -h, --help    show help
+  --version     print elarkd version
   -config PATH  path to config file
+  -system       install or control the system daemon
 `)
 }
 
