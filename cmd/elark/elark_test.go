@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	creackpty "github.com/creack/pty"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 	"github.com/hachiwii/exec-over-lark/internal/version"
 )
@@ -92,6 +93,9 @@ func TestHostWithoutCommandAllocatesPTYByDefault(t *testing.T) {
 	if start.Env["TERM"] != "xterm-256color" {
 		t.Fatalf("TERM env = %q, want xterm-256color fallback", start.Env["TERM"])
 	}
+	if start.Rows != 24 || start.Cols != 80 {
+		t.Fatalf("start size = %dx%d, want env fallback 24x80", start.Rows, start.Cols)
+	}
 }
 
 func TestTTYFlagsOverrideDefaults(t *testing.T) {
@@ -133,6 +137,48 @@ func TestTerminalEnvUsesLocalTermWithFallback(t *testing.T) {
 		if got != "xterm-256color" {
 			t.Fatalf("TERM fallback for %q = %q, want xterm-256color", value, got)
 		}
+	}
+}
+
+func TestCurrentTerminalSizePrefersTTYWinsize(t *testing.T) {
+	master, tty, err := creackpty.Open()
+	if err != nil {
+		if errors.Is(err, creackpty.ErrUnsupported) {
+			t.Skipf("pty unsupported: %v", err)
+		}
+		t.Fatalf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	if err := creackpty.Setsize(tty, &creackpty.Winsize{Rows: 37, Cols: 132}); err != nil {
+		t.Fatalf("set pty size: %v", err)
+	}
+
+	app, _, _ := newTestApp(nil, nil)
+	app.stdin = tty
+	rows, cols := app.currentTerminalSize()
+	if rows != 37 || cols != 132 {
+		t.Fatalf("terminal size = %dx%d, want TTY winsize 37x132", rows, cols)
+	}
+}
+
+func TestInteractivePTYStartUsesCurrentTerminalSize(t *testing.T) {
+	fake := &fakeClient{messages: []ipc.Message{ipc.ExitMessage("", 0)}}
+	app, _, stderr := newTestApp(fake, nil)
+	app.terminalSize = func() (int, int) { return 41, 123 }
+	configPath := testCLIConfigPath(t)
+
+	code := app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini"})
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if len(fake.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(fake.starts))
+	}
+	start := fake.starts[0]
+	if start.Rows != 41 || start.Cols != 123 {
+		t.Fatalf("start size = %dx%d, want current terminal size 41x123", start.Rows, start.Cols)
 	}
 }
 
@@ -350,6 +396,25 @@ func TestTermSignalStillForwardsToRemote(t *testing.T) {
 	}
 	if len(fake.closes) != 0 {
 		t.Fatalf("closes = %v, want none", fake.closes)
+	}
+}
+
+func TestWindowChangeForwardsCurrentTerminalSize(t *testing.T) {
+	fake := &fakeClient{
+		resizeCh: make(chan [2]int, 1),
+	}
+	app, _, _ := newTestApp(fake, nil)
+	app.terminalSize = func() (int, int) { return 42, 144 }
+	signals := installFakeSignalNotify(app)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	forwarder := app.forwardSignals(ctx, cancel, fake, "req-1", true, make(chan struct{}))
+	defer forwarder.stop()
+
+	signals.send(syscall.SIGWINCH)
+	if got := receiveResize(t, fake.resizeCh); got != [2]int{42, 144} {
+		t.Fatalf("resize = %v, want 42x144", got)
 	}
 }
 
@@ -604,6 +669,7 @@ type fakeClient struct {
 
 	startCh        chan ipc.StartSessionRequest
 	stdinCh        chan []byte
+	resizeCh       chan [2]int
 	closeSessionCh chan string
 	signalCh       chan string
 	clientClosedCh chan struct{}
@@ -627,6 +693,9 @@ func (f *fakeClient) SendStdin(ctx context.Context, requestID string, data []byt
 
 func (f *fakeClient) Resize(ctx context.Context, requestID string, rows, cols int) error {
 	f.resizes = append(f.resizes, [2]int{rows, cols})
+	if f.resizeCh != nil {
+		f.resizeCh <- [2]int{rows, cols}
+	}
 	return nil
 }
 
@@ -724,6 +793,17 @@ func receiveBytes(t *testing.T, ch <-chan []byte) []byte {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for bytes")
 		return nil
+	}
+}
+
+func receiveResize(t *testing.T, ch <-chan [2]int) [2]int {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resize")
+		return [2]int{}
 	}
 }
 

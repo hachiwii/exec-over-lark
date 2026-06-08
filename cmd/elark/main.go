@@ -53,6 +53,7 @@ type terminalRestorer interface {
 	Restore() error
 }
 type makeRawFunc func(io.Reader) (terminalRestorer, error)
+type terminalSizeFunc func() (int, int)
 
 type app struct {
 	stdin  io.Reader
@@ -64,6 +65,7 @@ type app struct {
 
 	stdinIsTerminal  func(io.Reader) bool
 	makeRawTerminal  makeRawFunc
+	terminalSize     terminalSizeFunc
 	notifySignals    func(chan<- os.Signal, ...os.Signal)
 	stopSignalNotify func(chan<- os.Signal)
 }
@@ -341,7 +343,7 @@ func (a *app) runRemote(cmd parsedCommand) int {
 		return 1
 	}
 
-	rows, cols := terminalSizeFromEnv(a.getenv)
+	rows, cols := a.currentTerminalSize()
 	start := ipc.StartSessionRequest{
 		RequestID:  requestID,
 		Host:       cmd.host,
@@ -526,7 +528,7 @@ func (a *app) forwardSignals(ctx context.Context, cancel context.CancelFunc, cli
 				case syscall.SIGTERM:
 					_ = client.Signal(ctx, requestID, "TERM")
 				case syscall.SIGWINCH:
-					rows, cols := terminalSizeFromEnv(a.getenv)
+					rows, cols := a.currentTerminalSize()
 					if rows > 0 && cols > 0 {
 						_ = client.Resize(ctx, requestID, rows, cols)
 					}
@@ -549,6 +551,19 @@ func (a *app) isStdinTerminal() bool {
 		return a.stdinIsTerminal(a.stdin)
 	}
 	return stdinIsTerminal(a.stdin)
+}
+
+func (a *app) currentTerminalSize() (int, int) {
+	if a.terminalSize != nil {
+		return sanitizeTerminalSize(a.terminalSize())
+	}
+	for _, file := range []any{a.stdin, a.stdout, a.stderr} {
+		rows, cols := terminalSizeFromFile(file)
+		if rows > 0 && cols > 0 {
+			return rows, cols
+		}
+	}
+	return terminalSizeFromEnv(a.getenv)
 }
 
 func (a *app) forwardRawTerminalStdin(ctx context.Context, client daemonClient, requestID string) (func(), error) {
@@ -1074,6 +1089,22 @@ func makeRawTerminal(r io.Reader) (terminalRestorer, error) {
 	return pty.MakeRaw(int(file.Fd()))
 }
 
+func terminalSizeFromFile(value any) (int, int) {
+	file, ok := value.(*os.File)
+	if !ok || file == nil {
+		return 0, 0
+	}
+	fd := int(file.Fd())
+	if !pty.IsTerminal(fd) {
+		return 0, 0
+	}
+	size, err := pty.TerminalSize(fd)
+	if err != nil {
+		return 0, 0
+	}
+	return sanitizeTerminalSize(size.Rows, size.Cols)
+}
+
 func terminalEnv(getenv func(string) string) map[string]string {
 	term := ""
 	if getenv != nil {
@@ -1091,6 +1122,10 @@ func terminalSizeFromEnv(getenv func(string) string) (int, int) {
 	}
 	rows, _ := strconv.Atoi(getenv("LINES"))
 	cols, _ := strconv.Atoi(getenv("COLUMNS"))
+	return sanitizeTerminalSize(rows, cols)
+}
+
+func sanitizeTerminalSize(rows, cols int) (int, int) {
 	if rows < 0 {
 		rows = 0
 	}
