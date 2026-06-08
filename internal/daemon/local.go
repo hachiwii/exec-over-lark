@@ -70,9 +70,9 @@ type LocalOptions struct {
 	EventSource EventSource
 	IPCListen   IPCListenFunc
 	Logger      *slog.Logger
+	Outbound    *outbound.Manager
 
-	TickInterval  time.Duration
-	FlushInterval time.Duration
+	TickInterval time.Duration
 }
 
 type Local struct {
@@ -82,10 +82,9 @@ type Local struct {
 	ipcListen   IPCListenFunc
 	logger      *slog.Logger
 
-	tickInterval  time.Duration
-	flushInterval time.Duration
+	tickInterval time.Duration
 
-	queue    *outbound.Queue
+	outbound *outbound.Manager
 	sessions *session.Manager
 
 	selfBotOpenID string
@@ -145,23 +144,16 @@ func NewLocal(opts LocalOptions) (*Local, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if opts.Outbound == nil {
+		return nil, errors.New("outbound manager is nil")
+	}
 
 	tickInterval := opts.TickInterval
 	if tickInterval <= 0 {
 		tickInterval = time.Second
 	}
-	flushInterval := opts.FlushInterval
-	if flushInterval <= 0 {
-		flushInterval = 100 * time.Millisecond
-	}
-
-	queue := outbound.New(
-		queueSender{client: client},
-		outbound.WithSendCooldown(cfg.Lark.SendCooldown.Duration()),
-		outbound.WithRequestLimitBytes(cfg.Lark.LarkTextRequestLimitBytes),
-	)
 	sessions := session.New(
-		session.WithOutboundQueue(queue),
+		session.WithOutbound(opts.Outbound),
 		session.WithHeartbeatInterval(cfg.Connection.HeartbeatInterval.Duration()),
 		session.WithHeartbeatTimeout(cfg.Connection.HeartbeatTimeout.Duration()),
 		session.WithSequenceGapTimeout(cfg.Connection.SequenceGapTimeout.Duration()),
@@ -169,15 +161,14 @@ func NewLocal(opts LocalOptions) (*Local, error) {
 	)
 
 	return &Local{
-		cfg:           cfg,
-		client:        client,
-		eventSource:   eventSource,
-		ipcListen:     ipcListen,
-		logger:        logger,
-		tickInterval:  tickInterval,
-		flushInterval: flushInterval,
-		queue:         queue,
-		sessions:      sessions,
+		cfg:          cfg,
+		client:       client,
+		eventSource:  eventSource,
+		ipcListen:    ipcListen,
+		logger:       logger,
+		tickInterval: tickInterval,
+		outbound:     opts.Outbound,
+		sessions:     sessions,
 	}, nil
 }
 
@@ -190,7 +181,21 @@ func (d *Local) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("resolve self bot open_id: %w", err)
 	}
+	return d.run(ctx, selfOpenID, true)
+}
 
+func (d *Local) RunServices(ctx context.Context, selfOpenID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	selfOpenID = strings.TrimSpace(selfOpenID)
+	if selfOpenID == "" {
+		return errors.New("local self bot open_id is required")
+	}
+	return d.run(ctx, selfOpenID, false)
+}
+
+func (d *Local) run(ctx context.Context, selfOpenID string, runEventSource bool) error {
 	d.mu.Lock()
 	if d.started {
 		d.mu.Unlock()
@@ -234,21 +239,15 @@ func (d *Local) Run(ctx context.Context) error {
 		}()
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := d.eventSource.Run(runCtx, selfOpenID, d.HandleLarkEvent); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
-			errCh <- err
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := d.flushLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
-			errCh <- err
-		}
-	}()
+	if runEventSource {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := d.eventSource.Run(runCtx, selfOpenID, d.HandleLarkEvent); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	wg.Add(1)
 	go func() {
@@ -316,7 +315,7 @@ func (d *Local) Status(_ context.Context, _ ipc.StatusRequest) (ipc.DaemonStatus
 			Checked:   true,
 			Connected: started,
 		},
-		Outbound: outboundStatusFromQueue(d.queue),
+		Outbound: outboundStatusFromManager(d.outbound),
 	}, nil
 }
 
@@ -350,20 +349,19 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 		Cols:      req.Cols,
 		Heartbeat: d.sessions.HeartbeatConfig(),
 	}
-	frame, err := protocol.NewJSONFrame(1, protocol.TypeStart, startPayload)
-	if err != nil {
-		return "", err
-	}
-	text, err := protocol.EncodeFrames([]protocol.Frame{frame})
-	if err != nil {
-		return "", err
-	}
-
-	root, err := d.client.SendRootMessage(ctx, host.ChatID, host.PeerBotOpenID, text)
+	root, err := d.outbound.OpenRoot(ctx, outbound.OpenRootRequest{
+		ChatID:            host.ChatID,
+		MentionOpenID:     host.PeerBotOpenID,
+		Role:              outbound.RoleLocal,
+		RequestID:         req.RequestID,
+		InitialType:       protocol.TypeStart,
+		InitialPayload:    startPayload,
+		HeartbeatInterval: d.cfg.Connection.HeartbeatInterval.Duration(),
+	})
 	if err != nil {
 		return "", fmt.Errorf("send start root message: %w", err)
 	}
-	connID := strings.TrimSpace(root.MessageID)
+	connID := strings.TrimSpace(root.RootMessageID)
 	if connID == "" {
 		return "", errors.New("lark root message response missing message_id")
 	}
@@ -412,45 +410,6 @@ func (d *Local) LocalSessions() []session.Snapshot {
 	return d.sessions.LocalSessions()
 }
 
-func (d *Local) flushLoop(ctx context.Context) error {
-	timer := time.NewTimer(d.flushInterval)
-	defer timer.Stop()
-
-	for {
-		flushed, err := d.queue.FlushReady(ctx)
-		if err != nil {
-			return err
-		}
-		if flushed {
-			continue
-		}
-
-		wait := d.flushInterval
-		if next, ok := d.queue.NextFlushAt(); ok {
-			wait = time.Until(next)
-			if wait < 0 {
-				wait = 0
-			}
-		}
-		if wait <= 0 {
-			wait = d.flushInterval
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(wait)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 func (d *Local) tickLoop(ctx context.Context) error {
 	ticker := time.NewTicker(d.tickInterval)
 	defer ticker.Stop()
@@ -489,22 +448,6 @@ func (s ipcSubscriber) Deliver(ctx context.Context, event session.LocalEvent) er
 	default:
 		return s.session.SendError(ctx, event.RequestID, ipc.NewRPCError(ipc.ErrorCodeProtocol, "unknown local event", string(event.Type)))
 	}
-}
-
-type queueSender struct {
-	client LarkClient
-}
-
-func (s queueSender) SendRootMessage(ctx context.Context, chatID, mentionOpenID, text string) (outbound.RootMessage, error) {
-	root, err := s.client.SendRootMessage(ctx, chatID, mentionOpenID, text)
-	if err != nil {
-		return outbound.RootMessage{}, err
-	}
-	return outbound.RootMessage{MessageID: root.MessageID}, nil
-}
-
-func (s queueSender) ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
-	return s.client.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
 }
 
 func defaultLarkFactory(cfg *config.Config) (LarkClient, error) {
@@ -546,23 +489,21 @@ func mergeIPCStartHost(base config.HostConfig, override ipc.HostConfig) config.H
 	return base
 }
 
-func outboundStatusFromQueue(q *outbound.Queue) ipc.OutboundQueueStatus {
-	if q == nil {
+func outboundStatusFromManager(manager *outbound.Manager) ipc.OutboundQueueStatus {
+	if manager == nil {
 		return ipc.OutboundQueueStatus{}
 	}
-	lastSentAt, hasLastSent := q.LastSentAt()
-	nextFlushAt, hasNextFlush := q.NextFlushAt()
-	targets := q.PendingTargets()
+	status := manager.Status()
 	out := ipc.OutboundQueueStatus{
 		Checked:        true,
-		PendingFrames:  q.PendingLen(),
-		PendingTargets: make([]ipc.OutboundTarget, 0, len(targets)),
-		LastSentAt:     lastSentAt,
-		HasLastSent:    hasLastSent,
-		NextFlushAt:    nextFlushAt,
-		HasNextFlush:   hasNextFlush,
+		PendingFrames:  status.PendingFrames,
+		PendingTargets: make([]ipc.OutboundTarget, 0, len(status.PendingTargets)),
+		LastSentAt:     status.LastAttemptAt,
+		HasLastSent:    status.HasLastAttempt,
+		NextFlushAt:    status.NextFlushAt,
+		HasNextFlush:   status.HasNextFlush,
 	}
-	for _, target := range targets {
+	for _, target := range status.PendingTargets {
 		out.PendingTargets = append(out.PendingTargets, ipc.OutboundTarget{
 			ChatID:        target.ChatID,
 			RootMessageID: target.RootMessageID,

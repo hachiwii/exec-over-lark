@@ -13,8 +13,8 @@ import (
 
 func TestLocalRoutesOutputAndCleansUpOnExit(t *testing.T) {
 	clock := newFakeClock()
-	queue := &fakeQueue{}
-	manager := New(WithClock(clock), WithOutboundQueue(queue))
+	out := newFakeOutbound()
+	manager := New(WithClock(clock), WithOutbound(out))
 	sub := &fakeSubscriber{}
 
 	if err := manager.RegisterLocal(LocalStart{
@@ -61,12 +61,12 @@ func TestLocalRoutesOutputAndCleansUpOnExit(t *testing.T) {
 	}
 }
 
-func TestLocalHeartbeatAndPeerTimeoutUseFakeClock(t *testing.T) {
+func TestLocalPeerTimeoutUseFakeClock(t *testing.T) {
 	clock := newFakeClock()
-	queue := &fakeQueue{}
+	out := newFakeOutbound()
 	manager := New(
 		WithClock(clock),
-		WithOutboundQueue(queue),
+		WithOutbound(out),
 		WithHeartbeatInterval(10*time.Second),
 		WithHeartbeatTimeout(30*time.Second),
 	)
@@ -83,15 +83,11 @@ func TestLocalHeartbeatAndPeerTimeoutUseFakeClock(t *testing.T) {
 
 	clock.Advance(10 * time.Second)
 	if err := manager.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick at heartbeat deadline returned error: %v", err)
+		t.Fatalf("Tick before peer timeout returned error: %v", err)
 	}
-	if len(queue.items) != 1 {
-		t.Fatalf("queued frames = %d, want 1 heartbeat", len(queue.items))
+	if len(out.items) != 0 {
+		t.Fatalf("outbound frames = %d, want none from session tick", len(out.items))
 	}
-	if queue.items[0].target.RootMessageID != "om_root" || queue.items[0].target.MentionOpenID != "ou_server" {
-		t.Fatalf("heartbeat target = %#v", queue.items[0].target)
-	}
-	assertFrame(t, queue.items[0].frames[0], 2, protocol.TypeHeartbeat)
 
 	clock.Advance(20*time.Second + time.Nanosecond)
 	err := manager.Tick(context.Background())
@@ -105,10 +101,10 @@ func TestLocalHeartbeatAndPeerTimeoutUseFakeClock(t *testing.T) {
 
 func TestLocalReceiveWindowGapTimeoutDeliversErrorAndCleansUp(t *testing.T) {
 	clock := newFakeClock()
-	queue := &fakeQueue{}
+	out := newFakeOutbound()
 	manager := New(
 		WithClock(clock),
-		WithOutboundQueue(queue),
+		WithOutbound(out),
 		WithSequenceGapTimeout(5*time.Second),
 	)
 	sub := &fakeSubscriber{}
@@ -150,8 +146,8 @@ func TestLocalReceiveWindowGapTimeoutDeliversErrorAndCleansUp(t *testing.T) {
 
 func TestRemoteAcceptStartSendsAckAndRoutesControls(t *testing.T) {
 	clock := newFakeClock()
-	queue := &fakeQueue{}
-	manager := New(WithClock(clock), WithOutboundQueue(queue))
+	out := newFakeOutbound()
+	manager := New(WithClock(clock), WithOutbound(out))
 	receiver := &fakeRemoteReceiver{}
 	start := protocol.StartPayload{
 		Cmd: "cat",
@@ -176,10 +172,10 @@ func TestRemoteAcceptStartSendsAckAndRoutesControls(t *testing.T) {
 	if snapshot.ConnID != "om_root" || snapshot.PeerHeartbeatTimeout != 40*time.Second {
 		t.Fatalf("snapshot = %#v, want root conn and 40s peer timeout", snapshot)
 	}
-	if len(queue.items) != 1 {
-		t.Fatalf("queued frames = %d, want start_ack", len(queue.items))
+	if len(out.items) != 1 {
+		t.Fatalf("queued frames = %d, want start_ack", len(out.items))
 	}
-	assertFrame(t, queue.items[0].frames[0], 1, protocol.TypeStartAck)
+	assertFrame(t, out.items[0].frames[0], 1, protocol.TypeStartAck)
 	if len(receiver.events) != 1 || receiver.events[0].Type != RemoteEventStart || receiver.events[0].Start.Cmd != "cat" {
 		t.Fatalf("receiver start events = %#v", receiver.events)
 	}
@@ -210,10 +206,10 @@ func TestRemoteAcceptStartSendsAckAndRoutesControls(t *testing.T) {
 
 func TestRemoteGapTimeoutSendsErrorAndCleansUp(t *testing.T) {
 	clock := newFakeClock()
-	queue := &fakeQueue{}
+	out := newFakeOutbound()
 	manager := New(
 		WithClock(clock),
-		WithOutboundQueue(queue),
+		WithOutbound(out),
 		WithSequenceGapTimeout(5*time.Second),
 	)
 	receiver := &fakeRemoteReceiver{}
@@ -244,17 +240,15 @@ func TestRemoteGapTimeoutSendsErrorAndCleansUp(t *testing.T) {
 	if !containsRemoteEvent(receiver.events, RemoteEventSequenceGapTimeout) {
 		t.Fatalf("remote events = %#v, want sequence gap timeout", receiver.events)
 	}
-	if len(queue.items) != 2 {
-		t.Fatalf("queued frames = %d, want start_ack and error", len(queue.items))
+	if len(out.items) != 2 {
+		t.Fatalf("queued frames = %d, want start_ack and error", len(out.items))
 	}
-	assertFrame(t, queue.items[1].frames[0], 2, protocol.TypeError)
-	if len(manager.RemoteSessions()) != 0 {
-		t.Fatalf("RemoteSessions after gap timeout = %#v, want none", manager.RemoteSessions())
-	}
+	assertFrame(t, out.items[1].frames[0], 2, protocol.TypeError)
+	waitRemoteSessionsLen(t, manager, 0)
 }
 
 func TestUnauthorizedPeerIsRejected(t *testing.T) {
-	manager := New(WithOutboundQueue(&fakeQueue{}))
+	manager := New(WithOutbound(newFakeOutbound()))
 	if err := manager.RegisterLocal(LocalStart{
 		RequestID:     "req-1",
 		RootMessageID: "om_root",
@@ -292,20 +286,72 @@ func (c *fakeClock) Advance(d time.Duration) {
 }
 
 type queuedItem struct {
+	connID string
+	role   outbound.Role
 	target outbound.Target
 	frames []protocol.Frame
 }
 
-type fakeQueue struct {
+type fakeOutbound struct {
+	conns map[string]*fakeOutboundConn
 	items []queuedItem
 }
 
-func (q *fakeQueue) Enqueue(_ context.Context, target outbound.Target, frames ...protocol.Frame) error {
-	q.items = append(q.items, queuedItem{
-		target: target,
-		frames: cloneFrames(frames),
+type fakeOutboundConn struct {
+	req outbound.RegisterConnectionRequest
+	seq uint64
+}
+
+func newFakeOutbound() *fakeOutbound {
+	return &fakeOutbound{conns: make(map[string]*fakeOutboundConn)}
+}
+
+func (o *fakeOutbound) RegisterConnection(req outbound.RegisterConnectionRequest) error {
+	nextSeq := req.NextSeq
+	if nextSeq == 0 {
+		nextSeq = 1
+	}
+	o.conns[req.ConnID] = &fakeOutboundConn{req: req, seq: nextSeq}
+	return nil
+}
+
+func (o *fakeOutbound) Enqueue(_ context.Context, connID string, typ protocol.FrameType, payload []byte) error {
+	conn := o.conns[connID]
+	if conn == nil {
+		return outbound.ErrConnectionMissing
+	}
+	frame := protocol.Frame{Seq: conn.seq, Type: typ, Payload: append([]byte(nil), payload...)}
+	conn.seq++
+	o.items = append(o.items, queuedItem{
+		connID: connID,
+		role:   conn.req.Role,
+		target: conn.req.Target,
+		frames: []protocol.Frame{frame},
 	})
 	return nil
+}
+
+func (o *fakeOutbound) EnqueueJSON(ctx context.Context, connID string, typ protocol.FrameType, payload any) error {
+	raw, err := protocol.MarshalJSONPayload(payload)
+	if err != nil {
+		return err
+	}
+	return o.Enqueue(ctx, connID, typ, raw)
+}
+
+func (o *fakeOutbound) MarkCloseAfterDrained(connID string) {
+	conn := o.conns[connID]
+	if conn == nil {
+		return
+	}
+	delete(o.conns, connID)
+	if conn.req.OnDrained != nil {
+		go conn.req.OnDrained(context.Background())
+	}
+}
+
+func (o *fakeOutbound) DropConnection(connID string) {
+	delete(o.conns, connID)
 }
 
 type fakeSubscriber struct {
@@ -400,4 +446,21 @@ func containsRemoteEvent(events []RemoteEvent, typ RemoteEventType) bool {
 		}
 	}
 	return false
+}
+
+func waitRemoteSessionsLen(t *testing.T, manager *Manager, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := len(manager.RemoteSessions()); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("RemoteSessions did not become %d, got %d", want, len(manager.RemoteSessions()))
+		case <-ticker.C:
+		}
+	}
 }

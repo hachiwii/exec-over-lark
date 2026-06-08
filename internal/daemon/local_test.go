@@ -11,6 +11,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
+	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
@@ -38,8 +39,8 @@ func TestLocalRunLoadsConfigStartsIPCAndEventSource(t *testing.T) {
 			fakeIPC.handler = handler
 			return fakeIPC, nil
 		},
-		TickInterval:  time.Hour,
-		FlushInterval: time.Hour,
+		Outbound:     newTestOutboundManager(t, fakeLark),
+		TickInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("NewLocal returned error: %v", err)
@@ -141,6 +142,7 @@ func TestStartLocalSessionCreatesRootMessageAndSendsControls(t *testing.T) {
 	if err := local.Stdin(context.Background(), ipc.StdinRequest{RequestID: "req-1", Bytes: []byte("hello\n")}); err != nil {
 		t.Fatalf("Stdin returned error: %v", err)
 	}
+	waitRepliesLen(t, fakeLark, 1)
 	if len(fakeLark.replies) != 1 {
 		t.Fatalf("replies = %d, want 1", len(fakeLark.replies))
 	}
@@ -260,11 +262,11 @@ func TestHandleLarkEventIgnoresUnconfiguredPeer(t *testing.T) {
 func newTestLocal(t *testing.T, cfg *config.Config, client *fakeLarkClient) *Local {
 	t.Helper()
 	local, err := NewLocal(LocalOptions{
-		Config:        cfg,
-		LarkClient:    client,
-		EventSource:   NoopEventSource{},
-		TickInterval:  time.Hour,
-		FlushInterval: time.Hour,
+		Config:       cfg,
+		LarkClient:   client,
+		EventSource:  NoopEventSource{},
+		Outbound:     newTestOutboundManager(t, client),
+		TickInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("NewLocal returned error: %v", err)
@@ -325,6 +327,74 @@ func (c *fakeLarkClient) SendRootMessage(_ context.Context, chatID, mentionOpenI
 func (c *fakeLarkClient) ReplyRootMessage(_ context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
 	c.replies = append(c.replies, sentMessage{chatID: chatID, rootMessageID: rootMessageID, mentionOpenID: mentionOpenID, text: text})
 	return "om_reply", nil
+}
+
+type testOutboundSender struct {
+	client *fakeLarkClient
+}
+
+func (s testOutboundSender) SendRootMessage(ctx context.Context, _ outbound.Role, chatID, mentionOpenID, text string) (outbound.RootMessage, error) {
+	root, err := s.client.SendRootMessage(ctx, chatID, mentionOpenID, text)
+	if err != nil {
+		return outbound.RootMessage{}, err
+	}
+	return outbound.RootMessage{MessageID: root.MessageID}, nil
+}
+
+func (s testOutboundSender) ReplyRootMessage(ctx context.Context, _ outbound.Role, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
+	return s.client.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
+}
+
+func newTestOutboundManager(t *testing.T, client *fakeLarkClient) *outbound.Manager {
+	t.Helper()
+	manager, err := outbound.NewManager(outbound.ManagerOptions{
+		Sender:            testOutboundSender{client: client},
+		SendCooldown:      time.Millisecond,
+		RequestLimitBytes: config.DefaultLarkTextRequestLimitBytes,
+	})
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		_ = manager.Run(ctx)
+	}()
+	return manager
+}
+
+func waitRepliesLen(t *testing.T, client *fakeLarkClient, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if len(client.replies) >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("replies did not reach %d, got %d", want, len(client.replies))
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitReplyFramesLen(t *testing.T, client *fakeLarkClient, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if len(remoteReplyFrames(t, client)) >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("reply frames did not reach %d, got %d", want, len(remoteReplyFrames(t, client)))
+		case <-ticker.C:
+		}
+	}
 }
 
 type fakeEventSource struct {

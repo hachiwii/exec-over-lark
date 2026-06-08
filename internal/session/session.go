@@ -28,7 +28,7 @@ var (
 	ErrSessionClosed      = errors.New("session closed")
 	ErrUnauthorizedPeer   = errors.New("unauthorized session peer")
 	ErrUnexpectedFrame    = errors.New("unexpected frame for session direction")
-	ErrNoOutboundQueue    = errors.New("session outbound queue is nil")
+	ErrNoOutboundManager  = errors.New("session outbound manager is nil")
 	ErrRemoteSessionLimit = errors.New("remote session limit reached")
 )
 
@@ -38,8 +38,12 @@ type Clock interface {
 	Now() time.Time
 }
 
-type FrameQueue interface {
-	Enqueue(ctx context.Context, target outbound.Target, frames ...protocol.Frame) error
+type Outbound interface {
+	RegisterConnection(outbound.RegisterConnectionRequest) error
+	Enqueue(ctx context.Context, connID string, typ protocol.FrameType, payload []byte) error
+	EnqueueJSON(ctx context.Context, connID string, typ protocol.FrameType, payload any) error
+	MarkCloseAfterDrained(connID string)
+	DropConnection(connID string)
 }
 
 type Option func(*Manager)
@@ -47,8 +51,8 @@ type Option func(*Manager)
 type Manager struct {
 	mu sync.Mutex
 
-	clock Clock
-	queue FrameQueue
+	clock    Clock
+	outbound Outbound
 
 	heartbeatInterval  time.Duration
 	heartbeatTimeout   time.Duration
@@ -115,9 +119,9 @@ func WithClock(clock Clock) Option {
 	}
 }
 
-func WithOutboundQueue(queue FrameQueue) Option {
+func WithOutbound(out Outbound) Option {
 	return func(m *Manager) {
-		m.queue = queue
+		m.outbound = out
 	}
 }
 
@@ -283,9 +287,7 @@ type sessionState struct {
 	localHeartbeatTimeout  time.Duration
 	peerHeartbeatTimeout   time.Duration
 
-	target outbound.Target
-	txSeq  *protocol.Sequencer
-	rx     *protocol.RecvWindow
+	rx *protocol.RecvWindow
 }
 
 func ConnID(rootMessageID, messageID string) string {
@@ -322,10 +324,6 @@ func (m *Manager) RegisterLocal(start LocalStart, subscriber Subscriber) error {
 	if nextSeq == 0 {
 		nextSeq = 2
 	}
-	txSeq, err := protocol.NewSequencerFrom(nextSeq)
-	if err != nil {
-		return err
-	}
 	peerTimeout := start.HeartbeatTimeout
 	if peerTimeout <= 0 {
 		peerTimeout = m.heartbeatTimeout
@@ -340,6 +338,9 @@ func (m *Manager) RegisterLocal(start LocalStart, subscriber Subscriber) error {
 
 	sess, ok := m.localByConn[connID]
 	if !ok {
+		if m.outbound == nil {
+			return ErrNoOutboundManager
+		}
 		sess = &localSession{
 			base: sessionState{
 				connID:                 connID,
@@ -352,17 +353,26 @@ func (m *Manager) RegisterLocal(start LocalStart, subscriber Subscriber) error {
 				localHeartbeatInterval: m.heartbeatInterval,
 				localHeartbeatTimeout:  m.heartbeatTimeout,
 				peerHeartbeatTimeout:   peerTimeout,
-				target: outbound.Target{
-					ChatID:        start.ChatID,
-					RootMessageID: connID,
-					MentionOpenID: start.PeerBotOpenID,
-				},
-				txSeq: txSeq,
-				rx:    protocol.NewRecvWindow(m.sequenceGapTimeout, protocol.WithClock(m.clock)),
+				rx:                     protocol.NewRecvWindow(m.sequenceGapTimeout, protocol.WithClock(m.clock)),
 			},
 			host:           start.Host,
 			rootMessageURL: start.RootMessageURL,
 			subscribers:    make(map[string]Subscriber),
+		}
+		if err := m.outbound.RegisterConnection(outbound.RegisterConnectionRequest{
+			ConnID:            connID,
+			Role:              outbound.RoleLocal,
+			Target:            outbound.Target{ChatID: start.ChatID, RootMessageID: connID, MentionOpenID: start.PeerBotOpenID},
+			NextSeq:           nextSeq,
+			HeartbeatInterval: m.heartbeatInterval,
+			OnDrop: func(ctx context.Context, reason outbound.DropReason) {
+				m.handleLocalOutboundDrop(ctx, connID, reason)
+			},
+			OnDrained: func(ctx context.Context) {
+				m.CloseLocalConn(connID)
+			},
+		}); err != nil {
+			return err
 		}
 		m.localByConn[connID] = sess
 	} else if err := sess.base.ensurePeer(start.ChatID, start.PeerBotOpenID); err != nil {
@@ -484,7 +494,7 @@ func (m *Manager) AcceptRemoteStart(ctx context.Context, msg InboundMessage, rec
 		return nil, fmt.Errorf("%w: %s", ErrInvalidSession, connID)
 	}
 	if len(m.remoteByConn) >= m.maxRemoteSessions {
-		err := m.replyRemoteErrorLocked(ctx, connID, msg.ChatID, msg.SenderOpenID, "remote session limit reached", "")
+		err := m.replyRemoteError(ctx, connID, msg.ChatID, msg.SenderOpenID, "remote session limit reached", "")
 		m.mu.Unlock()
 		if err != nil {
 			return nil, err
@@ -533,23 +543,33 @@ func (m *Manager) AcceptRemoteStart(ctx context.Context, msg InboundMessage, rec
 			localHeartbeatInterval: m.heartbeatInterval,
 			localHeartbeatTimeout:  m.heartbeatTimeout,
 			peerHeartbeatTimeout:   peerTimeout,
-			target: outbound.Target{
-				ChatID:        msg.ChatID,
-				RootMessageID: connID,
-				MentionOpenID: msg.SenderOpenID,
-			},
-			txSeq: protocol.NewSequencer(),
-			rx:    rx,
+			rx:                     rx,
 		},
 		start:    startPayload,
 		receiver: receiver,
 	}
-	ack, err := sess.base.txSeq.JSONFrame(protocol.TypeStartAck, protocol.StartAckPayload{Heartbeat: m.HeartbeatConfig()})
-	if err != nil {
+	if m.outbound == nil {
+		m.mu.Unlock()
+		return nil, ErrNoOutboundManager
+	}
+	if err := m.outbound.RegisterConnection(outbound.RegisterConnectionRequest{
+		ConnID:            connID,
+		Role:              outbound.RoleRemote,
+		Target:            outbound.Target{ChatID: msg.ChatID, RootMessageID: connID, MentionOpenID: msg.SenderOpenID},
+		NextSeq:           1,
+		HeartbeatInterval: m.heartbeatInterval,
+		OnDrop: func(ctx context.Context, reason outbound.DropReason) {
+			m.handleRemoteOutboundDrop(ctx, connID, reason)
+		},
+		OnDrained: func(ctx context.Context) {
+			m.CloseRemoteConn(connID)
+		},
+	}); err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
-	if err := m.enqueueLocked(ctx, &sess.base, ack); err != nil {
+	if err := m.outbound.EnqueueJSON(ctx, connID, protocol.TypeStartAck, protocol.StartAckPayload{Heartbeat: m.HeartbeatConfig()}); err != nil {
+		m.outbound.DropConnection(connID)
 		m.mu.Unlock()
 		return nil, err
 	}
@@ -668,11 +688,6 @@ func (m *Manager) Tick(ctx context.Context) error {
 			errOut = firstErr(errOut, err)
 			continue
 		}
-		if sess.base.heartbeatDue(now) {
-			if err := m.enqueueHeartbeatLocked(ctx, &sess.base); err != nil {
-				errOut = firstErr(errOut, err)
-			}
-		}
 	}
 	for _, sess := range sortedRemoteSessions(m.remoteByConn) {
 		if sess.base.closed {
@@ -694,11 +709,6 @@ func (m *Manager) Tick(ctx context.Context) error {
 			m.closeRemoteLocked(sess)
 			errOut = firstErr(errOut, event.Err)
 			continue
-		}
-		if sess.base.heartbeatDue(now) {
-			if err := m.enqueueHeartbeatLocked(ctx, &sess.base); err != nil {
-				errOut = firstErr(errOut, err)
-			}
 		}
 	}
 	m.mu.Unlock()
@@ -768,6 +778,42 @@ func (m *Manager) CloseRemoteConn(connID string) {
 	}
 }
 
+func (m *Manager) handleLocalOutboundDrop(ctx context.Context, connID string, reason outbound.DropReason) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.localByConn[connID]
+	if !ok || sess.base.closed {
+		return
+	}
+	detail := ""
+	if reason.Err != nil {
+		detail = reason.Err.Error()
+	}
+	m.deliverLocalErrorLocked(ctx, sess, reason.Err, "outbound send failed", detail)
+	m.closeLocalLocked(sess)
+}
+
+func (m *Manager) handleRemoteOutboundDrop(ctx context.Context, connID string, reason outbound.DropReason) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.remoteByConn[connID]
+	if !ok || sess.base.closed {
+		return
+	}
+	detail := ""
+	if reason.Err != nil {
+		detail = reason.Err.Error()
+	}
+	m.deliverRemoteLocked(ctx, sess, RemoteEvent{
+		Type:    RemoteEventError,
+		ConnID:  connID,
+		Message: "outbound send failed",
+		Detail:  detail,
+		Err:     reason.Err,
+	})
+	m.closeRemoteLocked(sess)
+}
+
 func (m *Manager) sendLocalJSONFrame(ctx context.Context, requestID string, typ protocol.FrameType, payload any, closeAfter bool) error {
 	raw, err := protocol.MarshalJSONPayload(payload)
 	if err != nil {
@@ -788,19 +834,17 @@ func (m *Manager) sendLocalFrame(ctx context.Context, requestID string, typ prot
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrSessionClosed, connID)
 	}
-	frame, err := sess.base.txSeq.Frame(typ, payload)
-	if err != nil {
+	if m.outbound == nil {
 		m.mu.Unlock()
-		return err
+		return ErrNoOutboundManager
 	}
-	if err := m.enqueueLocked(ctx, &sess.base, frame); err != nil {
-		m.mu.Unlock()
+	m.mu.Unlock()
+	if err := m.outbound.Enqueue(ctx, connID, typ, payload); err != nil {
 		return err
 	}
 	if closeAfter {
-		m.closeLocalLocked(sess)
+		m.outbound.MarkCloseAfterDrained(connID)
 	}
-	m.mu.Unlock()
 	return nil
 }
 
@@ -819,19 +863,17 @@ func (m *Manager) sendRemoteFrame(ctx context.Context, connID string, typ protoc
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrSessionNotFound, connID)
 	}
-	frame, err := sess.base.txSeq.Frame(typ, payload)
-	if err != nil {
+	if m.outbound == nil {
 		m.mu.Unlock()
-		return err
+		return ErrNoOutboundManager
 	}
-	if err := m.enqueueLocked(ctx, &sess.base, frame); err != nil {
-		m.mu.Unlock()
+	m.mu.Unlock()
+	if err := m.outbound.Enqueue(ctx, connID, typ, payload); err != nil {
 		return err
 	}
 	if closeAfter {
-		m.closeRemoteLocked(sess)
+		m.outbound.MarkCloseAfterDrained(connID)
 	}
-	m.mu.Unlock()
 	return nil
 }
 
@@ -945,7 +987,11 @@ func (m *Manager) handleRemoteSequenceErrorLocked(ctx context.Context, sess *rem
 		Detail:  err.Error(),
 		Err:     err,
 	})
-	_ = m.sendRemoteErrorLocked(ctx, sess, "sequence gap timeout", err.Error())
+	if m.outbound != nil {
+		_ = m.outbound.EnqueueJSON(ctx, sess.base.connID, protocol.TypeError, protocol.ErrorPayload{Message: "sequence gap timeout", Detail: err.Error()})
+		m.outbound.MarkCloseAfterDrained(sess.base.connID)
+		return
+	}
 	m.closeRemoteLocked(sess)
 }
 
@@ -983,46 +1029,30 @@ func (m *Manager) deliverRemoteLocked(ctx context.Context, sess *remoteSession, 
 	return sess.receiver.Deliver(ctx, event)
 }
 
-func (m *Manager) enqueueHeartbeatLocked(ctx context.Context, state *sessionState) error {
-	frame, err := state.txSeq.JSONFrame(protocol.TypeHeartbeat, protocol.HeartbeatPayload{})
-	if err != nil {
-		return err
+func (m *Manager) replyRemoteError(ctx context.Context, connID, chatID, senderOpenID, message, detail string) error {
+	if m.outbound == nil {
+		return ErrNoOutboundManager
 	}
-	return m.enqueueLocked(ctx, state, frame)
-}
-
-func (m *Manager) enqueueLocked(ctx context.Context, state *sessionState, frame protocol.Frame) error {
-	if m.queue == nil {
-		return ErrNoOutboundQueue
-	}
-	if err := m.queue.Enqueue(ctx, state.target, frame); err != nil {
-		return err
-	}
-	state.lastLocalSendAt = m.clock.Now()
-	return nil
-}
-
-func (m *Manager) sendRemoteErrorLocked(ctx context.Context, sess *remoteSession, message, detail string) error {
-	frame, err := sess.base.txSeq.JSONFrame(protocol.TypeError, protocol.ErrorPayload{Message: message, Detail: detail})
-	if err != nil {
-		return err
-	}
-	return m.enqueueLocked(ctx, &sess.base, frame)
-}
-
-func (m *Manager) replyRemoteErrorLocked(ctx context.Context, connID, chatID, senderOpenID, message, detail string) error {
-	if m.queue == nil {
-		return ErrNoOutboundQueue
-	}
-	frame, err := protocol.NewJSONFrame(1, protocol.TypeError, protocol.ErrorPayload{Message: message, Detail: detail})
-	if err != nil {
-		return err
-	}
-	return m.queue.Enqueue(ctx, outbound.Target{
+	target := outbound.Target{
 		ChatID:        chatID,
 		RootMessageID: connID,
 		MentionOpenID: senderOpenID,
-	}, frame)
+	}
+	if err := m.outbound.RegisterConnection(outbound.RegisterConnectionRequest{
+		ConnID:            connID,
+		Role:              outbound.RoleRemote,
+		Target:            target,
+		NextSeq:           1,
+		HeartbeatInterval: 0,
+	}); err != nil {
+		return err
+	}
+	if err := m.outbound.EnqueueJSON(ctx, connID, protocol.TypeError, protocol.ErrorPayload{Message: message, Detail: detail}); err != nil {
+		m.outbound.DropConnection(connID)
+		return err
+	}
+	m.outbound.MarkCloseAfterDrained(connID)
+	return nil
 }
 
 func (m *Manager) closeLocalLocked(sess *localSession) {
@@ -1038,6 +1068,9 @@ func (m *Manager) closeLocalLocked(sess *localSession) {
 		delete(m.localByRequest, requestID)
 	}
 	delete(m.localByConn, sess.base.connID)
+	if m.outbound != nil {
+		m.outbound.DropConnection(sess.base.connID)
+	}
 }
 
 func (m *Manager) closeRemoteLocked(sess *remoteSession) {
@@ -1050,6 +1083,9 @@ func (m *Manager) closeRemoteLocked(sess *remoteSession) {
 		_ = closer.Close()
 	}
 	delete(m.remoteByConn, sess.base.connID)
+	if m.outbound != nil {
+		m.outbound.DropConnection(sess.base.connID)
+	}
 }
 
 func (m *Manager) unsubscribeLocalLocked(requestID string) {
@@ -1076,13 +1112,6 @@ func (s *sessionState) ensurePeer(chatID, peerOpenID string) error {
 		return fmt.Errorf("%w: sender_open_id %q does not match peer_open_id %q", ErrUnauthorizedPeer, peerOpenID, s.peerOpenID)
 	}
 	return nil
-}
-
-func (s *sessionState) heartbeatDue(now time.Time) bool {
-	if s.closed || s.localHeartbeatInterval <= 0 {
-		return false
-	}
-	return !now.Before(s.lastLocalSendAt.Add(s.localHeartbeatInterval))
 }
 
 func (s *sessionState) peerTimedOut(now time.Time) bool {

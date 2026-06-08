@@ -160,8 +160,9 @@ func TestLarkWebSocketEventSourceHandleFrameIgnoresMalformedProtocolEvent(t *tes
 	}
 }
 
-func TestLarkWebSocketEventSourceHandleFrameReturnsHandlerError(t *testing.T) {
-	source := &larkWebSocketEventSource{}
+func TestLarkWebSocketEventSourceHandleFrameIsolatesHandlerError(t *testing.T) {
+	var stderr bytes.Buffer
+	source := &larkWebSocketEventSource{stderr: &stderr}
 	payload := websocketMessageEventJSON(t, websocketEventOptions{
 		EventID:      "evt_handler_error",
 		MessageID:    "om_handler_error",
@@ -177,14 +178,17 @@ func TestLarkWebSocketEventSourceHandleFrameReturnsHandlerError(t *testing.T) {
 		gotEvent = event
 		return wantErr
 	})
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("handleFrame error = %v, want %v", err, wantErr)
+	if err != nil {
+		t.Fatalf("handleFrame returned error: %v", err)
 	}
-	if status != http.StatusInternalServerError {
-		t.Fatalf("ack status = %d, want %d", status, http.StatusInternalServerError)
+	if status != http.StatusOK {
+		t.Fatalf("ack status = %d, want %d", status, http.StatusOK)
 	}
 	if gotEvent.EventID != "evt_handler_error" || gotEvent.MessageID != "om_handler_error" {
 		t.Fatalf("event = %#v", gotEvent)
+	}
+	if !strings.Contains(stderr.String(), "ignored daemon handler error") || !strings.Contains(stderr.String(), wantErr.Error()) {
+		t.Fatalf("stderr = %q, want handler error log", stderr.String())
 	}
 }
 

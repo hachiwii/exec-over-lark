@@ -147,20 +147,19 @@ type OutboundQueueStatus struct {
 	HasNextFlush   bool
 }
 
-func OutboundStatusFromQueue(q *outbound.Queue) OutboundQueueStatus {
-	if q == nil {
+func OutboundStatusFromManager(manager *outbound.Manager) OutboundQueueStatus {
+	if manager == nil {
 		return OutboundQueueStatus{}
 	}
-	lastSentAt, hasLastSent := q.LastSentAt()
-	nextFlushAt, hasNextFlush := q.NextFlushAt()
+	status := manager.Status()
 	return OutboundQueueStatus{
 		Checked:        true,
-		PendingFrames:  q.PendingLen(),
-		PendingTargets: q.PendingTargets(),
-		LastSentAt:     lastSentAt,
-		HasLastSent:    hasLastSent,
-		NextFlushAt:    nextFlushAt,
-		HasNextFlush:   hasNextFlush,
+		PendingFrames:  status.PendingFrames,
+		PendingTargets: status.PendingTargets,
+		LastSentAt:     status.LastAttemptAt,
+		HasLastSent:    status.HasLastAttempt,
+		NextFlushAt:    status.NextFlushAt,
+		HasNextFlush:   status.HasNextFlush,
 	}
 }
 

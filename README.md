@@ -173,7 +173,7 @@ socket_path = "~/.local/run/exec-over-lark/elarkd.sock"
 [lark]
 app_id = "cli_client_xxx"
 app_secret = "client_secret_xxx"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]
@@ -202,15 +202,15 @@ stream_chunk_bytes = 12000
 
 - `node_name`：当前节点名，用于诊断输出。
 - `default_host`：默认 host 名称。
-- `ipc.enabled = true`：允许 `elark` CLI 通过本地 Unix socket 调用本地 daemon。
+- `ipc.enabled = true`：启动本地 client 服务，允许 `elark` CLI 通过本地 Unix socket 调用本地 daemon。
 - `ipc.socket_path`：本地 daemon socket 路径，所在目录权限不能宽于 `0700`。
 - `lark.app_id` / `lark.app_secret`：client bot 的凭据。
-- `lark.send_cooldown`：两次飞书发送之间的最小间隔，默认 `"1000ms"`。
+- `lark.send_cooldown`：同一 chat 内两次飞书发送之间的最小间隔，默认 `"500ms"`；不同 chat 的发送冷却彼此独立。
 - `lark.lark_text_request_limit_bytes`：飞书文本消息请求体上限，第一版固定为 `153600`。
 - `connection.heartbeat_interval`：连接空闲多久后发送 heartbeat，默认 `"10s"`。
 - `connection.heartbeat_timeout`：声明给对端的超时时间，默认 `"30s"`。
 - `connection.sequence_gap_timeout`：收到跳号 frame 后等待缺失序号的最长时间，默认 `"30s"`。
-- `exec.enabled = false`：本地侧不接受飞书消息触发本机命令执行。
+- `exec.enabled = false`：不启动远端 server 执行服务，因此不会接受飞书消息触发本机命令执行。
 - `hosts.<name>.chat_id`：该 host 使用的话题群 ID。
 - `hosts.<name>.peer_bot_open_id`：该 host 的 server bot OpenID，本地只处理它发出的返回消息。
 - `hosts.<name>.shell`：远端默认 shell。
@@ -229,7 +229,7 @@ socket_path = "~/.local/run/exec-over-lark/elarkd.sock"
 [lark]
 app_id = "cli_server_xxx"
 app_secret = "server_secret_xxx"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]
@@ -248,13 +248,15 @@ stream_chunk_bytes = 12000
 
 远端侧字段说明：
 
-- `ipc.enabled = false`：远端通常不暴露本地 CLI socket。
+- `ipc.enabled = false`：不启动本地 client 服务，因此远端只作为 server 执行命令；如果设为 `true`，同一个 daemon 会同时启动 client 和 server 两侧。
 - `lark.app_id` / `lark.app_secret`：server bot 的凭据。
-- `exec.enabled = true`：允许飞书消息触发远端命令执行。
+- `exec.enabled = true`：启动远端 server 执行服务，允许飞书消息触发本机命令执行。
 - `exec.default_shell`：非交互命令使用的默认 shell。
 - `exec.max_sessions`：远端同时执行的 session 上限，默认 `8`。
 - `exec.stream_chunk_bytes`：远端 stdout/stderr 切片大小，默认 `12000`。
 - `exec.allowed_chat_ids`：可选 chat 白名单。不配置表示允许所有 chat。
+
+`ipc.enabled` 和 `exec.enabled` 是两个独立开关：只开 `ipc.enabled` 是 client-only daemon，只开 `exec.enabled` 是 server-only daemon，两个都开时 daemon 会同时运行 client 和 server 模式，并共享同一个飞书 websocket。共享 websocket 意味着这一份配置只能对应一个 bot 身份；如果 client 和 server 使用两个不同 bot app，仍需要分别启动两个 daemon。
 
 所有时间字段都使用字符串，支持 `ms`、`s`、`m`、`h`、`d`，例如 `"1000ms"`、`"10s"`、`"5m"`、`"1h"`。
 
@@ -412,9 +414,9 @@ go build ./cmd/elarkd
 - `internal/config`：TOML 配置、默认路径、模板生成和权限检查。
 - `internal/ipc`：本地 Unix socket 协议。
 - `internal/lark`：飞书 OpenAPI client、token、bot OpenID、bot 入群检查和消息发送。
-- `internal/outbound`：发送队列、限流、聚合和拆分。
+- `internal/outbound`：按 chat 共享的发送调度、限流、聚合、重试和 heartbeat。
 - `internal/protocol`：`EOL1` frame 编解码。
-- `internal/session`：连接、序列窗口、heartbeat 和 session 分发。
+- `internal/session`：连接、序列窗口、peer timeout 和 session 分发。
 - `internal/remoteexec`：远端非交互命令执行。
 - `internal/pty`：Unix PTY 和终端控制。
 - `internal/bootstrap`：server bot 入群 bootstrap 消息。

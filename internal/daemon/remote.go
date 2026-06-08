@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -70,6 +71,8 @@ type RemoteOptions struct {
 	SelfBotOpenID string
 	Sender        RemoteSender
 	Executor      RemoteExecutor
+	Logger        *slog.Logger
+	Outbound      *outbound.Manager
 }
 
 type RemoteDaemon struct {
@@ -79,9 +82,10 @@ type RemoteDaemon struct {
 	selfBotOpenID string
 	sender        RemoteSender
 	executor      RemoteExecutor
+	logger        *slog.Logger
 
-	queue   *outbound.Queue
-	manager *session.Manager
+	outbound *outbound.Manager
+	manager  *session.Manager
 
 	allowedChats map[string]struct{}
 
@@ -108,7 +112,7 @@ func RemoteConfigFromConfig(cfg *config.Config) RemoteConfig {
 	}
 }
 
-func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
+func NewRemote(opts RemoteOptions) (*RemoteDaemon, error) {
 	cfg := normalizeRemoteConfig(opts.Config)
 	if !cfg.ExecEnabled {
 		return nil, ErrRemoteExecDisabled
@@ -122,6 +126,13 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 	if opts.Sender == nil {
 		return nil, ErrRemoteMissingSender
 	}
+	if opts.Outbound == nil {
+		return nil, errors.New("outbound manager is nil")
+	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	executor := opts.Executor
 	if executor == nil {
 		if strings.TrimSpace(cfg.DefaultShell) == "" {
@@ -130,13 +141,8 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 		executor = remoteexecAdapter{executor: remoteexec.New(cfg.DefaultShell)}
 	}
 
-	queue := outbound.New(
-		replyOnlyOutboundSender{sender: opts.Sender},
-		outbound.WithSendCooldown(cfg.SendCooldown),
-		outbound.WithRequestLimitBytes(cfg.LarkTextRequestLimitBytes),
-	)
 	manager := session.New(
-		session.WithOutboundQueue(queue),
+		session.WithOutbound(opts.Outbound),
 		session.WithHeartbeatInterval(cfg.HeartbeatInterval),
 		session.WithHeartbeatTimeout(cfg.HeartbeatTimeout),
 		session.WithSequenceGapTimeout(cfg.SequenceGapTimeout),
@@ -150,7 +156,8 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 		selfBotOpenID: strings.TrimSpace(opts.SelfBotOpenID),
 		sender:        opts.Sender,
 		executor:      executor,
-		queue:         queue,
+		logger:        logger,
+		outbound:      opts.Outbound,
 		manager:       manager,
 		allowedChats:  stringSet(cfg.AllowedChatIDs),
 		tasks:         make(map[string]*remoteTask),
@@ -158,6 +165,14 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 }
 
 func (d *RemoteDaemon) Run(ctx context.Context) error {
+	return d.run(ctx, true)
+}
+
+func (d *RemoteDaemon) RunServices(ctx context.Context) error {
+	return d.run(ctx, false)
+}
+
+func (d *RemoteDaemon) run(ctx context.Context, runEventSource bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -170,31 +185,29 @@ func (d *RemoteDaemon) Run(ctx context.Context) error {
 	loops.Add(1)
 	go func() {
 		defer loops.Done()
-		if err := d.flushLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
-			errCh <- err
-		}
-	}()
-	loops.Add(1)
-	go func() {
-		defer loops.Done()
 		if err := d.tickLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
 			errCh <- err
 		}
 	}()
 
 	var err error
-	if d.eventSource != nil {
-		err = d.eventSource.Run(runCtx, d.selfBotOpenID, d.HandleMessageEvent)
+	if runEventSource {
+		if d.eventSource != nil {
+			err = d.eventSource.Run(runCtx, d.selfBotOpenID, d.HandleMessageEvent)
+		} else {
+			err = d.consumeEventStream(runCtx)
+		}
 	} else {
-		err = d.consumeEventStream(runCtx)
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case err = <-errCh:
+		}
 	}
 	if err != nil {
 		cancel()
 	}
 	d.wg.Wait()
-	if err == nil {
-		err = d.flushPending(ctx)
-	}
 	cancel()
 	loops.Wait()
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -328,45 +341,6 @@ func (d *RemoteDaemon) unregisterTask(connID string) {
 	delete(d.tasks, connID)
 }
 
-func (d *RemoteDaemon) flushLoop(ctx context.Context) error {
-	timer := time.NewTimer(100 * time.Millisecond)
-	defer timer.Stop()
-
-	for {
-		flushed, err := d.queue.FlushReady(ctx)
-		if err != nil {
-			return err
-		}
-		if flushed {
-			continue
-		}
-
-		wait := 100 * time.Millisecond
-		if next, ok := d.queue.NextFlushAt(); ok {
-			wait = time.Until(next)
-			if wait < 0 {
-				wait = 0
-			}
-		}
-		if wait <= 0 {
-			wait = 100 * time.Millisecond
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(wait)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 func (d *RemoteDaemon) tickLoop(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -379,34 +353,6 @@ func (d *RemoteDaemon) tickLoop(ctx context.Context) error {
 			_ = d.manager.Tick(ctx)
 		}
 	}
-}
-
-func (d *RemoteDaemon) flushPending(ctx context.Context) error {
-	for d.queue.PendingLen() > 0 {
-		flushed, err := d.queue.FlushReady(ctx)
-		if err != nil {
-			return err
-		}
-		if flushed {
-			continue
-		}
-		next, ok := d.queue.NextFlushAt()
-		if !ok {
-			return nil
-		}
-		wait := time.Until(next)
-		if wait < 0 {
-			wait = 0
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return nil
 }
 
 type remoteTask struct {
@@ -693,18 +639,6 @@ type remoteexecAdapter struct {
 
 func (a remoteexecAdapter) Start(ctx context.Context, req remoteexec.Request) (RemoteProcess, error) {
 	return a.executor.Start(ctx, req)
-}
-
-type replyOnlyOutboundSender struct {
-	sender RemoteSender
-}
-
-func (s replyOnlyOutboundSender) SendRootMessage(context.Context, string, string, string) (outbound.RootMessage, error) {
-	return outbound.RootMessage{}, errors.New("remote daemon cannot send root messages")
-}
-
-func (s replyOnlyOutboundSender) ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
-	return s.sender.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
 }
 
 type remoteEventMeta struct {

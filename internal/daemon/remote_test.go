@@ -61,9 +61,7 @@ func TestRemoteRunConsumesStartExecutesAndRepliesFrames(t *testing.T) {
 	if gotReq.Command != "printf hello" || gotReq.Shell != "/bin/sh" || gotReq.Cwd != "/srv/app" || gotReq.Env["LANG"] != "C" {
 		t.Fatalf("executor request = %#v", gotReq)
 	}
-	if len(fakeLark.replies) < 4 {
-		t.Fatalf("replies = %d, want start_ack, output, and exit frames", len(fakeLark.replies))
-	}
+	waitReplyFramesLen(t, fakeLark, 4)
 	for _, reply := range fakeLark.replies {
 		if reply.chatID != "oc_chat" || reply.rootMessageID != "om_root" || reply.mentionOpenID != "ou_client" {
 			t.Fatalf("reply target = %#v, want oc_chat/om_root/ou_client", reply)
@@ -205,6 +203,7 @@ func TestRemoteRunRepliesErrorWhenExecutorCannotStart(t *testing.T) {
 	if err := remote.Run(context.Background()); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
+	waitReplyFramesLen(t, fakeLark, 2)
 	frames := remoteReplyFrames(t, fakeLark)
 	gotTypes := remoteFrameTypes(frames)
 	wantTypes := []protocol.FrameType{protocol.TypeStartAck, protocol.TypeError}
@@ -225,15 +224,16 @@ func newTestRemote(t *testing.T, stream io.Reader, sender *fakeLarkClient, execu
 	if cfg.LarkTextRequestLimitBytes == 0 {
 		cfg.LarkTextRequestLimitBytes = config.DefaultLarkTextRequestLimitBytes
 	}
-	remote, err := NewRemoteDaemon(RemoteOptions{
+	remote, err := NewRemote(RemoteOptions{
 		Config:        cfg,
 		EventStream:   stream,
 		SelfBotOpenID: "ou_self_bot",
 		Sender:        sender,
 		Executor:      executor,
+		Outbound:      newTestOutboundManager(t, sender),
 	})
 	if err != nil {
-		t.Fatalf("NewRemoteDaemon returned error: %v", err)
+		t.Fatalf("NewRemote returned error: %v", err)
 	}
 	return remote
 }

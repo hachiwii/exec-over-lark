@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -146,7 +147,7 @@ func (c *Client) PersistentConnectionEndpoint(ctx context.Context) (WSEndpoint, 
 		return WSEndpoint{}, fmt.Errorf("decode lark websocket endpoint response: %w", err)
 	}
 	if out.Code != 0 {
-		return WSEndpoint{}, &apiError{Code: out.Code, Msg: out.Msg, Path: wsEndpointPath}
+		return WSEndpoint{}, &APIError{Code: out.Code, Msg: out.Msg, Path: wsEndpointPath}
 	}
 	if strings.TrimSpace(out.Data.URL) == "" {
 		return WSEndpoint{}, errors.New("lark websocket endpoint response missing URL")
@@ -354,7 +355,7 @@ func (c *Client) fetchTenantAccessToken(ctx context.Context) (string, int, error
 		return "", 0, err
 	}
 	if status < 200 || status >= 300 {
-		return "", 0, &apiError{Status: status, Path: tenantTokenPath}
+		return "", 0, &APIError{Status: status, Path: tenantTokenPath}
 	}
 
 	var out tenantTokenResponse
@@ -362,7 +363,7 @@ func (c *Client) fetchTenantAccessToken(ctx context.Context) (string, int, error
 		return "", 0, fmt.Errorf("decode lark tenant token response: %w", err)
 	}
 	if out.Code != 0 {
-		return "", 0, &apiError{Code: out.Code, Msg: out.Msg, Path: tenantTokenPath}
+		return "", 0, &APIError{Code: out.Code, Msg: out.Msg, Path: tenantTokenPath}
 	}
 	token := firstNonEmpty(out.TenantAccessToken, out.Data.TenantAccessToken)
 	if token == "" {
@@ -384,7 +385,7 @@ func (c *Client) doAuthorizedJSON(ctx context.Context, method, endpoint string, 
 			return nil
 		}
 		lastErr = err
-		var apiErr *apiError
+		var apiErr *APIError
 		if attempt == 0 && errors.As(err, &apiErr) && apiErr.TokenExpired() {
 			c.invalidateTenantToken(token)
 			continue
@@ -411,7 +412,7 @@ func (c *Client) doJSONWithToken(ctx context.Context, method, endpoint string, q
 		return fmt.Errorf("decode lark API response for %s: %w", endpoint, err)
 	}
 	if envelope.Code != 0 {
-		return &apiError{Code: envelope.Code, Msg: envelope.Msg, Path: endpoint}
+		return &APIError{Code: envelope.Code, Msg: envelope.Msg, Path: endpoint}
 	}
 	if out == nil {
 		return nil
@@ -463,7 +464,7 @@ func (c *Client) doRawJSON(ctx context.Context, method, endpoint string, query u
 }
 
 func apiErrorFromResponse(endpoint string, status int, respBody []byte) error {
-	err := &apiError{Status: status, Path: endpoint}
+	err := &APIError{Status: status, Path: endpoint}
 	var envelope larkEnvelope
 	if json.Unmarshal(respBody, &envelope) == nil {
 		err.Code = envelope.Code
@@ -534,14 +535,14 @@ type larkEnvelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
-type apiError struct {
+type APIError struct {
 	Status int
 	Code   int
 	Msg    string
 	Path   string
 }
 
-func (e *apiError) Error() string {
+func (e *APIError) Error() string {
 	if e.Status != 0 {
 		if e.Msg != "" {
 			return fmt.Sprintf("lark API %s returned HTTP status %d, code %d: %s", e.Path, e.Status, e.Code, e.Msg)
@@ -557,7 +558,7 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("lark API %s returned code %d", e.Path, e.Code)
 }
 
-func (e *apiError) TokenExpired() bool {
+func (e *APIError) TokenExpired() bool {
 	if e.Status == http.StatusUnauthorized {
 		return true
 	}
@@ -568,6 +569,43 @@ func (e *apiError) TokenExpired() bool {
 	msg := strings.ToLower(e.Msg)
 	return strings.Contains(msg, "token") &&
 		(strings.Contains(msg, "expire") || strings.Contains(msg, "invalid"))
+}
+
+func IsRetryableSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Status >= 500 && apiErr.Status <= 599 {
+			return true
+		}
+		if apiErr.Status >= 400 && apiErr.Status <= 499 && apiErr.Code == 230020 {
+			return true
+		}
+		return false
+	}
+	return isNetworkConnectionError(err)
+}
+
+func isNetworkConnectionError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 
 type messageRequest struct {
