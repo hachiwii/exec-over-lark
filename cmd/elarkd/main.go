@@ -71,6 +71,8 @@ func runForeground(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "elarkd: %v\n", err)
 		return 1
 	}
+	cleanupRuntimeStatus := writeRuntimeStatus(*configPath)
+	defer cleanupRuntimeStatus()
 	larkClient, err := lark.NewClient(lark.ClientConfig{
 		AppID:     cfg.Lark.AppID,
 		AppSecret: cfg.Lark.AppSecret,

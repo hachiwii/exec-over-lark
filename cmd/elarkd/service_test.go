@@ -146,6 +146,7 @@ func TestPrintServiceStatus(t *testing.T) {
 		Loaded:    true,
 		Running:   true,
 		State:     "running",
+		Version:   "v1.2.3",
 	})
 	for _, want := range []string{
 		"status: running",
@@ -153,9 +154,34 @@ func TestPrintServiceStatus(t *testing.T) {
 		"running: yes",
 		"mode: system",
 		"user: me",
+		"version: v1.2.3",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("status output missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestEnrichServiceRuntimeStatusFallsBackToRuntimeFile(t *testing.T) {
+	home := t.TempDir()
+	path := runtimeStatusPath(home)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"version":"v7.8.9","pid":123,"started_at":"2026-06-08T00:00:00Z"}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status := serviceStatus{
+		Spec: serviceSpec{
+			ConfigPath: filepath.Join(home, "missing-config.toml"),
+			UserHome:   home,
+		},
+		Running: true,
+	}
+	enrichServiceRuntimeStatus(&status)
+	if status.Version != "v7.8.9" {
+		t.Fatalf("version = %q, want v7.8.9", status.Version)
 	}
 }

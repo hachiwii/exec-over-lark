@@ -15,6 +15,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/hachiwii/exec-over-lark/internal/session"
+	"github.com/hachiwii/exec-over-lark/internal/version"
 )
 
 var (
@@ -309,6 +310,7 @@ func (d *Local) Status(_ context.Context, _ ipc.StatusRequest) (ipc.DaemonStatus
 
 	return ipc.DaemonStatus{
 		Running:       started,
+		Version:       version.String(),
 		SocketPath:    socketPath,
 		SelfBotOpenID: selfBotOpenID,
 		Event: ipc.EventConnectionStatus{

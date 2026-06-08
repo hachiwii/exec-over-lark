@@ -163,6 +163,7 @@ type StatusRequest struct {
 
 type DaemonStatus struct {
 	Running       bool   `json:"running"`
+	Version       string `json:"version,omitempty"`
 	SocketPath    string `json:"socket_path,omitempty"`
 	SelfBotOpenID string `json:"self_bot_open_id,omitempty"`
 

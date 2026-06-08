@@ -56,8 +56,9 @@ jobs:
           target="exec-over-lark_${version}_${GOOS}_${GOARCH}"
           mkdir -p "dist/${target}"
 
-          go build -trimpath -ldflags "-s -w" -o "dist/${target}/elark" ./cmd/elark
-          go build -trimpath -ldflags "-s -w" -o "dist/${target}/elarkd" ./cmd/elarkd
+          ldflags="-s -w -X github.com/hachiwii/exec-over-lark/internal/version.Version=${version}"
+          go build -trimpath -ldflags "${ldflags}" -o "dist/${target}/elark" ./cmd/elark
+          go build -trimpath -ldflags "${ldflags}" -o "dist/${target}/elarkd" ./cmd/elarkd
 
           cp README.md LICENSE "dist/${target}/"
           tar -C dist -czf "dist/${target}.tar.gz" "${target}"

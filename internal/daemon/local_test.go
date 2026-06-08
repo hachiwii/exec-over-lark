@@ -90,6 +90,13 @@ func TestLocalRunLoadsConfigStartsIPCAndEventSource(t *testing.T) {
 	if got := local.SelfBotOpenID(); got != "ou_self_bot" {
 		t.Fatalf("SelfBotOpenID = %q, want ou_self_bot", got)
 	}
+	status, err := local.Status(context.Background(), ipc.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status returned error: %v", err)
+	}
+	if status.Version != "dev" {
+		t.Fatalf("Status version = %q, want dev", status.Version)
+	}
 }
 
 func TestStartLocalSessionCreatesRootMessageAndSendsControls(t *testing.T) {

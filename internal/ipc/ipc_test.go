@@ -77,6 +77,7 @@ func TestStatusRoundTripOverUnixSocket(t *testing.T) {
 			requests <- req
 			return DaemonStatus{
 				Running:       true,
+				Version:       "v9.9.9",
 				SocketPath:    req.SocketPath,
 				SelfBotOpenID: "ou_self_bot",
 				Event: EventConnectionStatus{
@@ -112,7 +113,7 @@ func TestStatusRoundTripOverUnixSocket(t *testing.T) {
 	if req.RequestID != "status-1" || req.SocketPath != server.SocketPath() || req.NodeName != "local" {
 		t.Fatalf("status request mismatch: %#v", req)
 	}
-	if !status.Running || status.SelfBotOpenID != "ou_self_bot" || !status.Event.Connected ||
+	if !status.Running || status.Version != "v9.9.9" || status.SelfBotOpenID != "ou_self_bot" || !status.Event.Connected ||
 		status.Outbound.PendingFrames != 2 || len(status.Outbound.PendingTargets) != 1 {
 		t.Fatalf("status response mismatch: %#v", status)
 	}

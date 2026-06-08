@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,12 +17,15 @@ import (
 	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
+	"github.com/hachiwii/exec-over-lark/internal/ipc"
+	"github.com/hachiwii/exec-over-lark/internal/version"
 )
 
 const (
 	serviceLabel      = "com.hachiwii.exec-over-lark.elarkd"
 	systemdUnit       = "elarkd.service"
 	installRecordFile = "install.json"
+	runtimeStatusFile = "runtime-status.json"
 )
 
 func runServiceCommand(action string, args []string, stdout, stderr io.Writer) int {
@@ -82,6 +86,7 @@ func runServiceCommand(action string, args []string, stdout, stderr io.Writer) i
 			fmt.Fprintf(stderr, "elarkd status: %v\n", err)
 			return 1
 		}
+		enrichServiceRuntimeStatus(&status)
 		printServiceStatus(stdout, status)
 		return 0
 	}
@@ -447,6 +452,7 @@ type serviceStatus struct {
 	Running   bool
 	State     string
 	Detail    string
+	Version   string
 }
 
 func getServiceStatus(spec serviceSpec) (serviceStatus, error) {
@@ -494,6 +500,126 @@ func getServiceStatus(spec serviceSpec) (serviceStatus, error) {
 	}
 }
 
+func enrichServiceRuntimeStatus(status *serviceStatus) {
+	if status == nil || !status.Running {
+		return
+	}
+	version, err := queryRunningDaemonVersion(status.Spec)
+	if err != nil || strings.TrimSpace(version) == "" {
+		version, err = readRuntimeStatusVersion(status.Spec.UserHome)
+	}
+	if err != nil || strings.TrimSpace(version) == "" {
+		status.Version = "unknown"
+		return
+	}
+	status.Version = version
+}
+
+func queryRunningDaemonVersion(spec serviceSpec) (string, error) {
+	cfg, err := config.Load(spec.ConfigPath)
+	if err != nil {
+		return "", err
+	}
+	if !cfg.IPC.Enabled {
+		return "", errors.New("ipc is disabled")
+	}
+	socketPath, err := expandServiceUserPath(cfg.IPC.SocketPath, spec.UserHome)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	client, err := ipc.Dial(ctx, socketPath)
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	status, err := client.Status(ctx, ipc.StatusRequest{RequestID: "elarkd-status-version"})
+	if err != nil {
+		return "", err
+	}
+	return status.Version, nil
+}
+
+type runtimeStatusRecord struct {
+	Version    string `json:"version"`
+	PID        int    `json:"pid"`
+	BinaryPath string `json:"binary_path,omitempty"`
+	ConfigPath string `json:"config_path,omitempty"`
+	StartedAt  string `json:"started_at"`
+}
+
+func writeRuntimeStatus(configPath string) func() {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return func() {}
+	}
+	path := runtimeStatusPath(home)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return func() {}
+	}
+	binaryPath, _ := os.Executable()
+	if binaryPath != "" {
+		if abs, err := filepath.Abs(binaryPath); err == nil {
+			binaryPath = abs
+		}
+	}
+	resolvedConfig, _ := config.ResolvePath(configPath)
+	record := runtimeStatusRecord{
+		Version:    version.String(),
+		PID:        os.Getpid(),
+		BinaryPath: binaryPath,
+		ConfigPath: resolvedConfig,
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	raw, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return func() {}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+		return func() {}
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return func() {}
+	}
+	return func() {
+		_ = os.Remove(path)
+	}
+}
+
+func readRuntimeStatusVersion(home string) (string, error) {
+	path := runtimeStatusPath(home)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var record runtimeStatusRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return "", err
+	}
+	return record.Version, nil
+}
+
+func runtimeStatusPath(home string) string {
+	return filepath.Join(home, ".local", "state", "exec-over-lark", runtimeStatusFile)
+}
+
+func expandServiceUserPath(path, home string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home = strings.TrimSpace(home)
+		if home == "" {
+			return "", errors.New("service user home is empty")
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return config.ExpandUserPath(path)
+}
+
 func printServiceStatus(w io.Writer, status serviceStatus) {
 	spec := status.Spec
 	fmt.Fprintf(w, "status: %s\n", status.State)
@@ -503,6 +629,9 @@ func printServiceStatus(w io.Writer, status serviceStatus) {
 	fmt.Fprintf(w, "mode: %s\n", serviceMode(spec.System))
 	if spec.UserName != "" {
 		fmt.Fprintf(w, "user: %s\n", spec.UserName)
+	}
+	if status.Version != "" {
+		fmt.Fprintf(w, "version: %s\n", status.Version)
 	}
 	fmt.Fprintf(w, "service file: %s\n", spec.FilePath)
 	fmt.Fprintf(w, "binary: %s\n", spec.BinaryPath)
