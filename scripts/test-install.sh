@@ -177,6 +177,8 @@ assert_contains "$output" "Daemon service:"
 assert_contains "$output" "${install_dir}/elarkd install"
 assert_contains "$output" "Start background process:"
 assert_contains "$output" "${install_dir}/elarkd start"
+assert_contains "$output" "Check status:"
+assert_contains "$output" "${install_dir}/elarkd status"
 assert_contains "$(cat "${tmpdir}/calls-default")" "elarkd install"
 
 output_no_install=$(
@@ -207,8 +209,9 @@ output_system=$(
 	sh "${repo_root}/scripts/install.sh" --system 2>&1
 )
 
-assert_contains "$output_system" "elark install: registering elarkd as a system service"
+assert_contains "$output_system" "elark install: registering elarkd as a system service for the current user"
 assert_contains "$output_system" "sudo ${install_dir_system}/elarkd install --system"
-assert_contains "$output_system" "sudo ${install_dir_system}/elarkd start --system"
+assert_contains "$output_system" "sudo ${install_dir_system}/elarkd start"
+assert_contains "$output_system" "${install_dir_system}/elarkd status"
 assert_contains "$(cat "${tmpdir}/calls-system")" "sudo ${install_dir_system}/elarkd install --system"
 assert_contains "$(cat "${tmpdir}/calls-system")" "elarkd install --system"

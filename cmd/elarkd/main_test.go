@@ -23,10 +23,12 @@ func TestHelpIncludesInitCommand(t *testing.T) {
 		"elarkd run [--config PATH]",
 		"elarkd init (--client|--server)",
 		"elarkd install [--config PATH] [--system]",
+		"elarkd status [--system]",
 		"elarkd doctor [--config PATH]",
 		"Commands:",
 		"run        run elarkd in the foreground",
 		"init       write a client or server config template",
+		"status     show the installed daemon service status",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("help output = %q, want %q", output, want)

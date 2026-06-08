@@ -244,7 +244,7 @@ run_daemon_install() {
 	elarkd_bin="${install_dir}/elarkd"
 	[ -x "$elarkd_bin" ] || die "installed ${elarkd_bin} is not executable"
 	if [ "$SYSTEM_INSTALL" -eq 1 ]; then
-		progress "registering elarkd as a system service"
+		progress "registering elarkd as a system service for the current user"
 		if [ "$(id -u)" -eq 0 ]; then
 			"$elarkd_bin" install --system || die "elarkd system install failed"
 		else
@@ -353,10 +353,13 @@ fi
 log ""
 log "Start background process:"
 if [ "$SYSTEM_INSTALL" -eq 1 ]; then
-	log "  sudo ${install_dir}/elarkd start --system"
+	log "  sudo ${install_dir}/elarkd start"
 else
 	log "  ${install_dir}/elarkd start"
 fi
+log ""
+log "Check status:"
+log "  ${install_dir}/elarkd status"
 
 if ! path_contains_dir "$install_dir"; then
 	log ""

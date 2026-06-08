@@ -36,7 +36,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runInit(args[1:], stdout, stderr)
 	case "doctor":
 		return runElarkdDoctor(args[1:], stdout, stderr)
-	case "install", "uninstall", "start", "restart", "stop":
+	case "install", "uninstall", "start", "restart", "stop", "status":
 		return runServiceCommand(args[0], args[1:], stdout, stderr)
 	default:
 		if strings.HasPrefix(args[0], "-") {
@@ -284,6 +284,7 @@ func printUsage(w io.Writer) {
   elarkd start [--system]
   elarkd restart [--system]
   elarkd stop [--system]
+  elarkd status [--system]
   elarkd doctor [--config PATH]
 
 Commands:
@@ -294,6 +295,7 @@ Commands:
   start      start the installed daemon service
   restart    restart the installed daemon service
   stop       stop the installed daemon service
+  status     show the installed daemon service status
   doctor     check config validity and Lark token refresh
 
 Options:

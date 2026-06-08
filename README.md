@@ -51,7 +51,7 @@ sh install.sh --no-install
 ```
 
 脚本优先安装到已经在 `PATH` 中的 `$HOME/.local/bin`，其次选择已有可写 `PATH` 目录；如果没有可写 `PATH` 目录，会创建 `$HOME/.local/bin` 并提示把它加入 `PATH`。
-传入 `--system` 时，脚本会用 `sudo elarkd install --system` 安装系统级 daemon；传入 `--no-install` 时只安装二进制，不自动注册 daemon。
+传入 `--system` 时，脚本会用 `sudo elarkd install --system` 安装系统级 daemon，但 daemon 进程会以触发安装的当前用户运行，并在 `~/.elark/install.json` 记录安装位置；后续 `sudo elarkd start`、`sudo elarkd stop`、`elarkd status` 等命令可以从记录中推断 system 模式，不需要再显式传 `--system`。传入 `--no-install` 时只安装二进制，不自动注册 daemon。
 
 如果还没有发布 GitHub release，`releases/latest` 会返回 404；先发布一个包含对应系统归档的 release 后再执行脚本。
 
@@ -269,6 +269,7 @@ stream_chunk_bytes = 12000
 ```bash
 elarkd install
 elarkd start
+elarkd status
 elark doctor
 ```
 
@@ -283,6 +284,7 @@ elarkd run --config ~/.elark/config.toml
 ```bash
 elarkd install
 elarkd start
+elarkd status
 ```
 
 ### 查看和诊断
