@@ -43,11 +43,11 @@ func TestLocalRoutesOutputAndCleansUpOnExit(t *testing.T) {
 	}
 
 	gotTypes := localEventTypes(sub.events)
-	wantTypes := []LocalEventType{LocalEventStdout, LocalEventStderr, LocalEventExit}
+	wantTypes := []LocalEventType{LocalEventStartAck, LocalEventStdout, LocalEventStderr, LocalEventExit}
 	if !reflect.DeepEqual(gotTypes, wantTypes) {
 		t.Fatalf("events = %v, want %v", gotTypes, wantTypes)
 	}
-	if string(sub.events[0].Bytes) != "out" || string(sub.events[1].Bytes) != "err" || sub.events[2].Code != 7 {
+	if string(sub.events[1].Bytes) != "out" || string(sub.events[2].Bytes) != "err" || sub.events[3].Code != 7 {
 		t.Fatalf("unexpected routed events: %#v", sub.events)
 	}
 	if _, ok := manager.ConnIDForRequest("req-1"); ok {

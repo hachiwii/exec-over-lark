@@ -23,7 +23,10 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
 
-const defaultRemoteEventBuffer = 128
+const (
+	defaultRemoteEventBuffer = 128
+	remoteInterruptKillGrace = 5 * time.Second
+)
 
 var (
 	ErrRemoteExecDisabled  = errors.New("remote exec is disabled")
@@ -494,6 +497,15 @@ func (t *remoteTask) startPayload() (protocol.StartPayload, bool) {
 func (t *remoteTask) controlLoop(ctx context.Context, cancel context.CancelFunc, proc RemoteProcess, done <-chan struct{}) {
 	for {
 		select {
+		case event := <-t.events:
+			if t.handleControlEvent(cancel, proc, done, event) {
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
 		case <-ctx.Done():
 			_ = proc.Kill()
 			return
@@ -504,29 +516,61 @@ func (t *remoteTask) controlLoop(ctx context.Context, cancel context.CancelFunc,
 			_ = proc.Kill()
 			return
 		case event := <-t.events:
-			switch event.Type {
-			case session.RemoteEventStdin:
-				if _, err := proc.Stdin().Write(event.Bytes); err != nil {
-					_ = t.daemon.manager.SendRemoteError(context.Background(), t.connID, "remote stdin failed", err.Error())
-					cancel()
-					_ = proc.Kill()
-					return
-				}
-			case session.RemoteEventSignal:
-				if sig, ok := signalByName(event.Name); ok {
-					_ = proc.Signal(sig)
-				}
-			case session.RemoteEventResize:
-				if resizable, ok := proc.(interface{ Resize(int, int) error }); ok {
-					_ = resizable.Resize(event.Rows, event.Cols)
-				}
-			case session.RemoteEventClose, session.RemoteEventError, session.RemoteEventSequenceGapTimeout, session.RemoteEventPeerTimeout:
-				cancel()
-				_ = proc.Kill()
+			if t.handleControlEvent(cancel, proc, done, event) {
 				return
 			}
 		}
 	}
+}
+
+func (t *remoteTask) handleControlEvent(cancel context.CancelFunc, proc RemoteProcess, done <-chan struct{}, event session.RemoteEvent) bool {
+	switch event.Type {
+	case session.RemoteEventStdin:
+		if _, err := proc.Stdin().Write(event.Bytes); err != nil {
+			_ = t.daemon.manager.SendRemoteError(context.Background(), t.connID, "remote stdin failed", err.Error())
+			cancel()
+			_ = proc.Kill()
+			return true
+		}
+	case session.RemoteEventSignal:
+		if sig, ok := signalByName(event.Name); ok {
+			_ = proc.Signal(sig)
+		}
+	case session.RemoteEventResize:
+		if resizable, ok := proc.(interface{ Resize(int, int) error }); ok {
+			_ = resizable.Resize(event.Rows, event.Cols)
+		}
+	case session.RemoteEventClose:
+		if event.Reason == protocol.CloseReasonClientInterrupt {
+			_ = proc.Signal(syscall.SIGINT)
+			killAfterGrace(proc, done, remoteInterruptKillGrace)
+			return true
+		}
+		cancel()
+		_ = proc.Kill()
+		return true
+	case session.RemoteEventError, session.RemoteEventSequenceGapTimeout, session.RemoteEventPeerTimeout:
+		cancel()
+		_ = proc.Kill()
+		return true
+	}
+	return false
+}
+
+func killAfterGrace(proc RemoteProcess, done <-chan struct{}, grace time.Duration) {
+	if grace <= 0 {
+		_ = proc.Kill()
+		return
+	}
+	go func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			_ = proc.Kill()
+		}
+	}()
 }
 
 func (t *remoteTask) copyOutput(ctx context.Context, wg *sync.WaitGroup, errCh chan<- error, r io.ReadCloser, typ protocol.FrameType) {

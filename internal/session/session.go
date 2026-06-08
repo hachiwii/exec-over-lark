@@ -182,11 +182,12 @@ type InboundMessage struct {
 type LocalEventType string
 
 const (
-	LocalEventStdout LocalEventType = "stdout"
-	LocalEventStderr LocalEventType = "stderr"
-	LocalEventExit   LocalEventType = "exit"
-	LocalEventError  LocalEventType = "error"
-	LocalEventClose  LocalEventType = "close"
+	LocalEventStartAck LocalEventType = "start_ack"
+	LocalEventStdout   LocalEventType = "stdout"
+	LocalEventStderr   LocalEventType = "stderr"
+	LocalEventExit     LocalEventType = "exit"
+	LocalEventError    LocalEventType = "error"
+	LocalEventClose    LocalEventType = "close"
 )
 
 type LocalEvent struct {
@@ -887,6 +888,7 @@ func (m *Manager) handleLocalFrameLocked(ctx context.Context, sess *localSession
 			return err
 		}
 		sess.base.peerHeartbeatTimeout = parseHeartbeatTimeout(payload.Heartbeat, m.heartbeatTimeout)
+		return m.deliverLocalLocked(ctx, sess, LocalEvent{Type: LocalEventStartAck, ConnID: sess.base.connID})
 	case protocol.TypeHeartbeat:
 		return nil
 	case protocol.TypeStdout:

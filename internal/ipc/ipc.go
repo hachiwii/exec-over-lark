@@ -38,6 +38,7 @@ const (
 	TypeClose        MessageType = "close"
 	TypeStatus       MessageType = "status"
 
+	TypeStartAck     MessageType = "start_ack"
 	TypeStdout       MessageType = "stdout"
 	TypeStderr       MessageType = "stderr"
 	TypeExit         MessageType = "exit"
@@ -385,6 +386,10 @@ func ExitMessage(requestID string, code int) Message {
 	return Message{Type: TypeExit, RequestID: requestID, Code: code}
 }
 
+func StartAckMessage(requestID string) Message {
+	return Message{Type: TypeStartAck, RequestID: requestID}
+}
+
 // Conn is a framed IPC connection. Concurrent writes are safe; callers should
 // keep reads to a single goroutine.
 type Conn struct {
@@ -693,6 +698,10 @@ type Session struct {
 	conn *Conn
 }
 
+func (s *Session) SendStartAck(ctx context.Context, requestID string) error {
+	return s.conn.Write(ctx, StartAckMessage(requestID))
+}
+
 func (s *Session) SendStdout(ctx context.Context, requestID string, data []byte) error {
 	return s.conn.Write(ctx, StdoutMessage(requestID, data))
 }
@@ -896,9 +905,9 @@ func (m Message) validate(maxPayloadBytes int) error {
 		if strings.TrimSpace(m.RequestID) == "" {
 			return fmt.Errorf("%w: status request_id is required", ErrInvalidMessage)
 		}
-	case TypeExit:
+	case TypeStartAck, TypeExit:
 		if strings.TrimSpace(m.RequestID) == "" {
-			return fmt.Errorf("%w: exit request_id is required", ErrInvalidMessage)
+			return fmt.Errorf("%w: %s request_id is required", ErrInvalidMessage, m.Type)
 		}
 	case TypeStatusResult:
 		if strings.TrimSpace(m.RequestID) == "" {

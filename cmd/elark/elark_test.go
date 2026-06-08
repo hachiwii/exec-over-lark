@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 )
@@ -22,8 +24,10 @@ func TestHostCommandUsesNonPTYByDefault(t *testing.T) {
 		},
 	}
 	app, stdout, stderr := newTestApp(fake, nil)
+	configPath := testCLIConfigPath(t)
 
 	code := app.run([]string{
+		"--config", configPath,
 		"--socket", "/tmp/elarkd.sock",
 		"--cwd", "/srv/app",
 		"macmini",
@@ -51,8 +55,9 @@ func TestHostCommandUsesNonPTYByDefault(t *testing.T) {
 func TestHostWithoutCommandAllocatesPTYByDefault(t *testing.T) {
 	fake := &fakeClient{messages: []ipc.Message{ipc.ExitMessage("", 0)}}
 	app, _, stderr := newTestApp(fake, nil)
+	configPath := testCLIConfigPath(t)
 
-	code := app.run([]string{"--socket", "/tmp/elarkd.sock", "macmini"})
+	code := app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini"})
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
@@ -69,8 +74,9 @@ func TestTTYFlagsOverrideDefaults(t *testing.T) {
 	t.Run("force command PTY", func(t *testing.T) {
 		fake := &fakeClient{messages: []ipc.Message{ipc.ExitMessage("", 0)}}
 		app, _, stderr := newTestApp(fake, nil)
+		configPath := testCLIConfigPath(t)
 
-		code := app.run([]string{"--socket", "/tmp/elarkd.sock", "-t", "macmini", "vim", "file"})
+		code := app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "-t", "macmini", "vim", "file"})
 		if code != 0 {
 			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 		}
@@ -82,8 +88,9 @@ func TestTTYFlagsOverrideDefaults(t *testing.T) {
 	t.Run("disable default PTY", func(t *testing.T) {
 		fake := &fakeClient{messages: []ipc.Message{ipc.ExitMessage("", 0)}}
 		app, _, stderr := newTestApp(fake, nil)
+		configPath := testCLIConfigPath(t)
 
-		code := app.run([]string{"--socket", "/tmp/elarkd.sock", "-T", "macmini"})
+		code := app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "-T", "macmini"})
 		if code != 0 {
 			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 		}
@@ -129,14 +136,16 @@ func TestConfigSocketIsUsedWithoutPrintingSecret(t *testing.T) {
 func TestStreamsOutputAndReturnsRemoteExitCode(t *testing.T) {
 	fake := &fakeClient{
 		messages: []ipc.Message{
+			ipc.StartAckMessage(""),
 			ipc.StdoutMessage("", []byte("hello\n")),
 			ipc.StderrMessage("", []byte("warn\n")),
 			ipc.ExitMessage("", 7),
 		},
 	}
 	app, stdout, stderr := newTestApp(fake, nil)
+	configPath := testCLIConfigPath(t)
 
-	code := app.run([]string{"--socket", "/tmp/elarkd.sock", "macmini", "job"})
+	code := app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini", "job"})
 	if code != 7 {
 		t.Fatalf("exit code = %d, want 7", code)
 	}
@@ -151,8 +160,9 @@ func TestStreamsOutputAndReturnsRemoteExitCode(t *testing.T) {
 func TestSendsPipedStdin(t *testing.T) {
 	fake := &fakeClient{messages: []ipc.Message{ipc.ExitMessage("", 0)}}
 	app, _, stderr := newTestApp(fake, strings.NewReader("hello\n"))
+	configPath := testCLIConfigPath(t)
 
-	code := app.run([]string{"--socket", "/tmp/elarkd.sock", "macmini", "cat"})
+	code := app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini", "cat"})
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
@@ -161,13 +171,115 @@ func TestSendsPipedStdin(t *testing.T) {
 	}
 }
 
+func TestInterruptClosesNonPTYSession(t *testing.T) {
+	fake := &fakeClient{
+		closeSessionCh: make(chan string, 1),
+		clientClosedCh: make(chan struct{}, 1),
+	}
+	app, _, _ := newTestApp(fake, nil)
+	signals := installFakeSignalNotify(app)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	forwarder := app.forwardSignals(ctx, cancel, fake, "req-1", false, make(chan struct{}))
+	defer forwarder.stop()
+
+	signals.send(os.Interrupt)
+	if got := receiveInterruptCode(t, forwarder.interrupted); got != clientInterruptExitCode {
+		t.Fatalf("interrupt exit code = %d, want %d", got, clientInterruptExitCode)
+	}
+	if got := receiveString(t, fake.closeSessionCh); got != "req-1" {
+		t.Fatalf("closed request = %q, want req-1", got)
+	}
+	receiveClosed(t, fake.clientClosedCh)
+	if len(fake.signals) != 0 {
+		t.Fatalf("signals = %v, want none", fake.signals)
+	}
+}
+
+func TestInterruptClosesPTYBeforeStartAck(t *testing.T) {
+	fake := &fakeClient{
+		closeSessionCh: make(chan string, 1),
+		clientClosedCh: make(chan struct{}, 1),
+	}
+	app, _, _ := newTestApp(fake, nil)
+	signals := installFakeSignalNotify(app)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	forwarder := app.forwardSignals(ctx, cancel, fake, "req-1", true, make(chan struct{}))
+	defer forwarder.stop()
+
+	signals.send(os.Interrupt)
+	if got := receiveInterruptCode(t, forwarder.interrupted); got != clientInterruptExitCode {
+		t.Fatalf("interrupt exit code = %d, want %d", got, clientInterruptExitCode)
+	}
+	if got := receiveString(t, fake.closeSessionCh); got != "req-1" {
+		t.Fatalf("closed request = %q, want req-1", got)
+	}
+	receiveClosed(t, fake.clientClosedCh)
+	if len(fake.signals) != 0 {
+		t.Fatalf("signals = %v, want none", fake.signals)
+	}
+}
+
+func TestInterruptSignalsPTYAfterStartAck(t *testing.T) {
+	fake := &fakeClient{
+		signalCh: make(chan string, 1),
+	}
+	app, _, _ := newTestApp(fake, nil)
+	signals := installFakeSignalNotify(app)
+	startAcked := make(chan struct{})
+	close(startAcked)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	forwarder := app.forwardSignals(ctx, cancel, fake, "req-1", true, startAcked)
+	defer forwarder.stop()
+
+	signals.send(os.Interrupt)
+	if got := receiveString(t, fake.signalCh); got != "INT" {
+		t.Fatalf("signal = %q, want INT", got)
+	}
+	select {
+	case code := <-forwarder.interrupted:
+		t.Fatalf("unexpected interrupt exit code %d", code)
+	default:
+	}
+	if len(fake.closes) != 0 {
+		t.Fatalf("closes = %v, want none", fake.closes)
+	}
+}
+
+func TestTermSignalStillForwardsToRemote(t *testing.T) {
+	fake := &fakeClient{
+		signalCh: make(chan string, 1),
+	}
+	app, _, _ := newTestApp(fake, nil)
+	signals := installFakeSignalNotify(app)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	forwarder := app.forwardSignals(ctx, cancel, fake, "req-1", false, make(chan struct{}))
+	defer forwarder.stop()
+
+	signals.send(syscall.SIGTERM)
+	if got := receiveString(t, fake.signalCh); got != "TERM" {
+		t.Fatalf("signal = %q, want TERM", got)
+	}
+	if len(fake.closes) != 0 {
+		t.Fatalf("closes = %v, want none", fake.closes)
+	}
+}
+
 func TestDaemonUnavailablePrompt(t *testing.T) {
 	app, _, stderr := newTestApp(nil, nil)
 	app.dial = func(context.Context, string) (daemonClient, error) {
 		return nil, errors.New("connect: no such file")
 	}
+	configPath := testCLIConfigPath(t)
 
-	code := app.run([]string{"--socket", "/tmp/missing.sock", "macmini", "date"})
+	code := app.run([]string{"--config", configPath, "--socket", "/tmp/missing.sock", "macmini", "date"})
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
@@ -315,7 +427,26 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 				return ""
 			}
 		},
+		notifySignals:    func(chan<- os.Signal, ...os.Signal) {},
+		stopSignalNotify: func(chan<- os.Signal) {},
 	}, stdout, stderr
+}
+
+type fakeSignalNotify struct {
+	ch chan<- os.Signal
+}
+
+func installFakeSignalNotify(app *app) *fakeSignalNotify {
+	notify := &fakeSignalNotify{}
+	app.notifySignals = func(ch chan<- os.Signal, _ ...os.Signal) {
+		notify.ch = ch
+	}
+	app.stopSignalNotify = func(chan<- os.Signal) {}
+	return notify
+}
+
+func (n *fakeSignalNotify) send(sig os.Signal) {
+	n.ch <- sig
 }
 
 type recordingDialer struct {
@@ -341,6 +472,10 @@ type fakeClient struct {
 	status         ipc.DaemonStatus
 	statusRequests []ipc.StatusRequest
 	closed         bool
+
+	closeSessionCh chan string
+	signalCh       chan string
+	clientClosedCh chan struct{}
 }
 
 func (f *fakeClient) StartSession(ctx context.Context, req ipc.StartSessionRequest) error {
@@ -360,11 +495,17 @@ func (f *fakeClient) Resize(ctx context.Context, requestID string, rows, cols in
 
 func (f *fakeClient) Signal(ctx context.Context, requestID, name string) error {
 	f.signals = append(f.signals, name)
+	if f.signalCh != nil {
+		f.signalCh <- name
+	}
 	return nil
 }
 
 func (f *fakeClient) CloseSession(ctx context.Context, requestID, reason string) error {
 	f.closes = append(f.closes, requestID)
+	if f.closeSessionCh != nil {
+		f.closeSessionCh <- requestID
+	}
 	return nil
 }
 
@@ -390,7 +531,41 @@ func (f *fakeClient) Receive(ctx context.Context) (ipc.Message, error) {
 
 func (f *fakeClient) Close() error {
 	f.closed = true
+	if f.clientClosedCh != nil {
+		f.clientClosedCh <- struct{}{}
+	}
 	return nil
+}
+
+func receiveInterruptCode(t *testing.T, ch <-chan int) int {
+	t.Helper()
+	select {
+	case code := <-ch:
+		return code
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for interrupt")
+		return 0
+	}
+}
+
+func receiveString(t *testing.T, ch <-chan string) string {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for string")
+		return ""
+	}
+}
+
+func receiveClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for close")
+	}
 }
 
 func startTestUnixSocket(t *testing.T, path string) {
@@ -462,4 +637,11 @@ default_cwd = "/srv/app"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func testCLIConfigPath(t *testing.T) string {
+	t.Helper()
+	dir := shortTempDir(t)
+	writeCLIConfig(t, dir, "test-secret")
+	return filepath.Join(dir, "config.toml")
 }

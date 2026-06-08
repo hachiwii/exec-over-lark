@@ -16,6 +16,9 @@ func TestStartSessionStreamsOutputOverUnixSocket(t *testing.T) {
 	server := startTestServer(t, HandlerFuncs{
 		StartSessionFunc: func(ctx context.Context, sess *Session, req StartSessionRequest) error {
 			started <- req
+			if err := sess.SendStartAck(ctx, req.RequestID); err != nil {
+				return err
+			}
 			if err := sess.SendStdout(ctx, req.RequestID, []byte("hello\n")); err != nil {
 				return err
 			}
@@ -61,6 +64,7 @@ func TestStartSessionStreamsOutputOverUnixSocket(t *testing.T) {
 		t.Fatalf("start request mismatch: %#v", gotStart)
 	}
 
+	assertMessage(t, receiveMessage(t, client), TypeStartAck, "req-1", "", 0)
 	assertMessage(t, receiveMessage(t, client), TypeStdout, "req-1", "hello\n", 0)
 	assertMessage(t, receiveMessage(t, client), TypeStderr, "req-1", "warn\n", 0)
 	assertMessage(t, receiveMessage(t, client), TypeExit, "req-1", "", 7)

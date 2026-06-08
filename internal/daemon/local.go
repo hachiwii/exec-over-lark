@@ -435,6 +435,8 @@ func (s ipcSubscriber) Deliver(ctx context.Context, event session.LocalEvent) er
 		return nil
 	}
 	switch event.Type {
+	case session.LocalEventStartAck:
+		return s.session.SendStartAck(ctx, event.RequestID)
 	case session.LocalEventStdout:
 		return s.session.SendStdout(ctx, event.RequestID, event.Bytes)
 	case session.LocalEventStderr:

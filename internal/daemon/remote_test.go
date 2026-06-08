@@ -9,7 +9,9 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
@@ -219,6 +221,54 @@ func TestRemoteRunRepliesErrorWhenExecutorCannotStart(t *testing.T) {
 	}
 }
 
+func TestRemoteClientInterruptCloseSignalsProcess(t *testing.T) {
+	proc := &fakeRemoteProcess{
+		waitCh:   make(chan remoteexec.Result, 1),
+		signalCh: make(chan os.Signal, 1),
+	}
+	fakeLark := &fakeLarkClient{}
+	executor := &fakeRemoteExecutor{process: proc, startCh: make(chan struct{}, 1)}
+	remote := newTestRemote(t, strings.NewReader(""), fakeLark, executor, RemoteConfig{
+		ExecEnabled:  true,
+		DefaultShell: "/bin/zsh",
+	})
+
+	start := protocol.StartPayload{Cmd: "sleep 60", Heartbeat: protocol.HeartbeatConfig{Timeout: "30s"}}
+	if err := remote.HandleMessageEvent(context.Background(), lark.MessageEvent{
+		MessageID:     "om_root",
+		RootMessageID: "om_root",
+		ChatID:        "oc_chat",
+		SenderOpenID:  "ou_client",
+		Mentions:      []lark.Mention{{OpenID: "ou_self_bot"}},
+		Frames:        []protocol.Frame{jsonFrame(t, 1, protocol.TypeStart, start)},
+	}); err != nil {
+		t.Fatalf("HandleMessageEvent start returned error: %v", err)
+	}
+	receiveStarted(t, executor.startCh)
+
+	if err := remote.HandleMessageEvent(context.Background(), lark.MessageEvent{
+		MessageID:     "om_close",
+		RootMessageID: "om_root",
+		ChatID:        "oc_chat",
+		SenderOpenID:  "ou_client",
+		Mentions:      []lark.Mention{{OpenID: "ou_self_bot"}},
+		Frames: []protocol.Frame{
+			jsonFrame(t, 2, protocol.TypeClose, protocol.ClosePayload{Reason: protocol.CloseReasonClientInterrupt}),
+		},
+	}); err != nil {
+		t.Fatalf("HandleMessageEvent close returned error: %v", err)
+	}
+
+	if got := receiveSignal(t, proc.signalCh); got != syscall.SIGINT {
+		t.Fatalf("signal = %v, want SIGINT", got)
+	}
+	if proc.killed {
+		t.Fatal("process was killed immediately; want graceful SIGINT for client interrupt")
+	}
+	proc.waitCh <- remoteexec.Result{ExitCode: 130}
+	waitRemoteTasks(t, remote)
+}
+
 func newTestRemote(t *testing.T, stream io.Reader, sender *fakeLarkClient, executor *fakeRemoteExecutor, cfg RemoteConfig) *RemoteDaemon {
 	t.Helper()
 	if cfg.LarkTextRequestLimitBytes == 0 {
@@ -242,6 +292,7 @@ type fakeRemoteExecutor struct {
 	requests []remoteexec.Request
 	process  *fakeRemoteProcess
 	err      error
+	startCh  chan struct{}
 }
 
 func (e *fakeRemoteExecutor) Start(_ context.Context, req remoteexec.Request) (RemoteProcess, error) {
@@ -257,16 +308,22 @@ func (e *fakeRemoteExecutor) Start(_ context.Context, req remoteexec.Request) (R
 	if e.process == nil {
 		e.process = &fakeRemoteProcess{}
 	}
+	if e.startCh != nil {
+		e.startCh <- struct{}{}
+	}
 	return e.process, nil
 }
 
 type fakeRemoteProcess struct {
-	stdin  captureWriteCloser
-	stdout []byte
-	stderr []byte
-	result remoteexec.Result
-	err    error
-	killed bool
+	stdin    captureWriteCloser
+	stdout   []byte
+	stderr   []byte
+	result   remoteexec.Result
+	err      error
+	killed   bool
+	waitCh   chan remoteexec.Result
+	signalCh chan os.Signal
+	signals  []os.Signal
 }
 
 func (p *fakeRemoteProcess) Stdin() io.WriteCloser {
@@ -282,10 +339,17 @@ func (p *fakeRemoteProcess) Stderr() io.ReadCloser {
 }
 
 func (p *fakeRemoteProcess) Wait() (remoteexec.Result, error) {
+	if p.waitCh != nil {
+		return <-p.waitCh, p.err
+	}
 	return p.result, p.err
 }
 
-func (p *fakeRemoteProcess) Signal(os.Signal) error {
+func (p *fakeRemoteProcess) Signal(sig os.Signal) error {
+	p.signals = append(p.signals, sig)
+	if p.signalCh != nil {
+		p.signalCh <- sig
+	}
 	return nil
 }
 
@@ -381,4 +445,38 @@ func remoteFrameTypes(frames []protocol.Frame) []protocol.FrameType {
 		out = append(out, frame.Type)
 	}
 	return out
+}
+
+func receiveSignal(t *testing.T, ch <-chan os.Signal) os.Signal {
+	t.Helper()
+	select {
+	case sig := <-ch:
+		return sig
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for signal")
+		return nil
+	}
+}
+
+func waitRemoteTasks(t *testing.T, remote *RemoteDaemon) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		remote.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for remote task")
+	}
+}
+
+func receiveStarted(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for remote process start")
+	}
 }

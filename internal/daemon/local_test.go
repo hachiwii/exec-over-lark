@@ -224,15 +224,15 @@ func TestHandleLarkEventDistributesRemoteFramesToSubscriber(t *testing.T) {
 	}
 
 	gotTypes := localEventTypes(sub.events)
-	wantTypes := []session.LocalEventType{session.LocalEventStdout, session.LocalEventExit}
+	wantTypes := []session.LocalEventType{session.LocalEventStartAck, session.LocalEventStdout, session.LocalEventExit}
 	if !reflect.DeepEqual(gotTypes, wantTypes) {
 		t.Fatalf("event types = %v, want %v", gotTypes, wantTypes)
 	}
-	if sub.events[0].RequestID != "req-1" || string(sub.events[0].Bytes) != "hello\n" {
-		t.Fatalf("stdout event = %#v", sub.events[0])
+	if sub.events[1].RequestID != "req-1" || string(sub.events[1].Bytes) != "hello\n" {
+		t.Fatalf("stdout event = %#v", sub.events[1])
 	}
-	if sub.events[1].RequestID != "req-1" || sub.events[1].Code != 0 {
-		t.Fatalf("exit event = %#v", sub.events[1])
+	if sub.events[2].RequestID != "req-1" || sub.events[2].Code != 0 {
+		t.Fatalf("exit event = %#v", sub.events[2])
 	}
 	if !sub.closed {
 		t.Fatal("subscriber was not closed after exit")

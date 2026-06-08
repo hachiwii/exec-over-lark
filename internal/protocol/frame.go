@@ -94,6 +94,8 @@ type ClosePayload struct {
 	Reason string `json:"reason"`
 }
 
+const CloseReasonClientInterrupt = "client_interrupt"
+
 type ErrorPayload struct {
 	Message string `json:"message"`
 	Detail  string `json:"detail,omitempty"`

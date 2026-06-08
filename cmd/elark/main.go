@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,11 +23,14 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/doctor"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
+	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/pelletier/go-toml/v2"
 )
 
 const (
-	defaultSocketPath = "~/.local/run/exec-over-lark/elarkd.sock"
+	defaultSocketPath           = "~/.local/run/exec-over-lark/elarkd.sock"
+	clientInterruptExitCode     = 130
+	clientInterruptCloseTimeout = 2 * time.Second
 )
 
 type daemonClient interface {
@@ -51,6 +55,9 @@ type app struct {
 	dial        dialFunc
 	startDaemon daemonStarter
 	getenv      func(string) string
+
+	notifySignals    func(chan<- os.Signal, ...os.Signal)
+	stopSignalNotify func(chan<- os.Signal)
 }
 
 type ttyMode int
@@ -112,12 +119,14 @@ func main() {
 
 func newApp() *app {
 	return &app{
-		stdin:       os.Stdin,
-		stdout:      os.Stdout,
-		stderr:      os.Stderr,
-		dial:        dialIPC,
-		startDaemon: startDaemonProcess,
-		getenv:      os.Getenv,
+		stdin:            os.Stdin,
+		stdout:           os.Stdout,
+		stderr:           os.Stderr,
+		dial:             dialIPC,
+		startDaemon:      startDaemonProcess,
+		getenv:           os.Getenv,
+		notifySignals:    signal.Notify,
+		stopSignalNotify: signal.Stop,
 	}
 }
 
@@ -361,8 +370,18 @@ func (a *app) runRemote(cmd parsedCommand) int {
 		return 1
 	}
 
-	stopSignals := a.forwardSignals(ctx, client, requestID)
-	defer stopSignals()
+	startAcked := make(chan struct{})
+	startAckReceived := false
+	markStartAck := func() {
+		if startAckReceived {
+			return
+		}
+		startAckReceived = true
+		close(startAcked)
+	}
+
+	signals := a.forwardSignals(ctx, cancel, client, requestID, start.Pty, startAcked)
+	defer signals.stop()
 
 	if shouldReadStdin(a.stdin) {
 		data, err := io.ReadAll(a.stdin)
@@ -381,6 +400,11 @@ func (a *app) runRemote(cmd parsedCommand) int {
 	for {
 		msg, err := client.Receive(ctx)
 		if err != nil {
+			select {
+			case code := <-signals.interrupted:
+				return code
+			default:
+			}
 			fmt.Fprintf(a.stderr, "elark: receive daemon output: %v\n", err)
 			return 1
 		}
@@ -389,6 +413,8 @@ func (a *app) runRemote(cmd parsedCommand) int {
 		}
 
 		switch msg.Type {
+		case ipc.TypeStartAck:
+			markStartAck()
 		case ipc.TypeStdout:
 			if _, err := a.stdout.Write(msg.Bytes); err != nil {
 				fmt.Fprintf(a.stderr, "elark: write stdout: %v\n", err)
@@ -429,10 +455,39 @@ func shouldAllocatePTY(cmd parsedCommand) bool {
 	}
 }
 
-func (a *app) forwardSignals(ctx context.Context, client daemonClient, requestID string) func() {
+type signalForwarder struct {
+	stop        func()
+	interrupted <-chan int
+}
+
+func (a *app) forwardSignals(ctx context.Context, cancel context.CancelFunc, client daemonClient, requestID string, pty bool, startAcked <-chan struct{}) signalForwarder {
 	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGWINCH)
+	notify := a.notifySignals
+	if notify == nil {
+		notify = signal.Notify
+	}
+	stopNotify := a.stopSignalNotify
+	if stopNotify == nil {
+		stopNotify = signal.Stop
+	}
+	notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGWINCH)
 	done := make(chan struct{})
+	interrupted := make(chan int, 1)
+	var closeOnce sync.Once
+
+	closeForInterrupt := func() {
+		closeOnce.Do(func() {
+			select {
+			case interrupted <- clientInterruptExitCode:
+			default:
+			}
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), clientInterruptCloseTimeout)
+			_ = client.CloseSession(closeCtx, requestID, protocol.CloseReasonClientInterrupt)
+			closeCancel()
+			_ = client.Close()
+			cancel()
+		})
+	}
 
 	go func() {
 		for {
@@ -442,6 +497,10 @@ func (a *app) forwardSignals(ctx context.Context, client daemonClient, requestID
 			case sig := <-sigCh:
 				switch sig {
 				case os.Interrupt:
+					if shouldCloseOnInterrupt(pty, startAcked) {
+						closeForInterrupt()
+						continue
+					}
 					_ = client.Signal(ctx, requestID, "INT")
 				case syscall.SIGTERM:
 					_ = client.Signal(ctx, requestID, "TERM")
@@ -455,9 +514,24 @@ func (a *app) forwardSignals(ctx context.Context, client daemonClient, requestID
 		}
 	}()
 
-	return func() {
-		signal.Stop(sigCh)
-		close(done)
+	return signalForwarder{
+		interrupted: interrupted,
+		stop: func() {
+			stopNotify(sigCh)
+			close(done)
+		},
+	}
+}
+
+func shouldCloseOnInterrupt(pty bool, startAcked <-chan struct{}) bool {
+	if !pty {
+		return true
+	}
+	select {
+	case <-startAcked:
+		return false
+	default:
+		return true
 	}
 }
 
