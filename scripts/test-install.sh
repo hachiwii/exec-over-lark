@@ -149,7 +149,7 @@ output=$(
 	ELARK_RELEASE_API_URL="file://${release_json}" \
 	ELARK_INSTALL_DIR="$install_dir" \
 	ELARK_INSTALL_TEST_CALLS="${tmpdir}/calls-default" \
-	sh "${repo_root}/scripts/install.sh"
+	sh "${repo_root}/scripts/install.sh" 2>&1
 )
 
 [ -x "${install_dir}/elark" ] || {
@@ -163,6 +163,13 @@ output=$(
 
 assert_contains "$output" "Installation directory:"
 assert_contains "$output" "$install_dir"
+assert_contains "$output" "elark install: starting installer for hachiwii/exec-over-lark"
+assert_contains "$output" "elark install: detected platform: ${goos}/${goarch}"
+assert_contains "$output" "elark install: downloading latest release metadata"
+assert_contains "$output" "elark install: selected release asset: ${archive_name}"
+assert_contains "$output" "elark install: installing elark to ${install_dir}/elark"
+assert_contains "$output" "elark install: registering elarkd user service"
+assert_contains "$output" "elark install: install complete"
 assert_contains "$output" "Generate initial configuration:"
 assert_contains "$output" "${install_dir}/elarkd init --client"
 assert_contains "$output" "${install_dir}/elarkd init --server"
@@ -177,7 +184,7 @@ output_no_install=$(
 	ELARK_RELEASE_API_URL="file://${release_json}" \
 	ELARK_INSTALL_DIR="$install_dir_no_install" \
 	ELARK_INSTALL_TEST_CALLS="${tmpdir}/calls-no-install" \
-	sh "${repo_root}/scripts/install.sh" --no-install
+	sh "${repo_root}/scripts/install.sh" --no-install 2>&1
 )
 
 [ -x "${install_dir_no_install}/elarkd" ] || {
@@ -188,6 +195,7 @@ if [ -e "${tmpdir}/calls-no-install" ] && grep -F "elarkd install" "${tmpdir}/ca
 	echo "--no-install still called elarkd install" >&2
 	exit 1
 fi
+assert_contains "$output_no_install" "elark install: skipping daemon service registration (--no-install)"
 assert_contains "$output_no_install" "${install_dir_no_install}/elarkd install"
 assert_contains "$output_no_install" "${install_dir_no_install}/elarkd start"
 
@@ -196,9 +204,10 @@ output_system=$(
 	ELARK_RELEASE_API_URL="file://${release_json}" \
 	ELARK_INSTALL_DIR="$install_dir_system" \
 	ELARK_INSTALL_TEST_CALLS="${tmpdir}/calls-system" \
-	sh "${repo_root}/scripts/install.sh" --system
+	sh "${repo_root}/scripts/install.sh" --system 2>&1
 )
 
+assert_contains "$output_system" "elark install: registering elarkd as a system service"
 assert_contains "$output_system" "sudo ${install_dir_system}/elarkd install --system"
 assert_contains "$output_system" "sudo ${install_dir_system}/elarkd start --system"
 assert_contains "$(cat "${tmpdir}/calls-system")" "sudo ${install_dir_system}/elarkd install --system"

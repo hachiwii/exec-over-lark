@@ -11,6 +11,10 @@ log() {
 	printf '%s\n' "$*"
 }
 
+progress() {
+	printf 'elark install: %s\n' "$*" >&2
+}
+
 warn() {
 	printf 'elark install: %s\n' "$*" >&2
 }
@@ -58,13 +62,18 @@ done
 download_to() {
 	url=$1
 	destination=$2
+	label=${3:-$(basename "$destination")}
+
+	progress "downloading ${label}"
 
 	if command_exists curl; then
-		curl -fsSL "$url" -o "$destination" || die "failed to download ${url}"
+		curl -fL --progress-bar "$url" -o "$destination" || die "failed to download ${url}"
+		progress "downloaded ${label}"
 		return
 	fi
 	if command_exists wget; then
-		wget -q -O "$destination" "$url" || die "failed to download ${url}"
+		wget -O "$destination" "$url" || die "failed to download ${url}"
+		progress "downloaded ${label}"
 		return
 	fi
 	die "missing dependency: install curl or wget"
@@ -191,6 +200,7 @@ verify_checksum() {
 	checksum_file=$1
 	archive=$2
 
+	progress "verifying checksum for $(basename "$archive")"
 	expected=$(sed -n '1s/^\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' "$checksum_file")
 	if [ ${#expected} -ne 64 ]; then
 		warn "could not parse checksum file; skipping checksum verification"
@@ -204,6 +214,7 @@ verify_checksum() {
 	fi
 
 	[ "$actual" = "$expected" ] || die "checksum mismatch for $(basename "$archive")"
+	progress "checksum verified for $(basename "$archive")"
 }
 
 find_extracted_binary() {
@@ -221,53 +232,69 @@ install_binary() {
 	destination="${install_dir}/${name}"
 	staged="${tmpdir}/${name}"
 
+	progress "installing ${name} to ${destination}"
 	cp "$source" "$staged" || die "failed to stage ${name}"
 	chmod 0755 "$staged" || die "failed to mark ${name} executable"
 	mv "$staged" "$destination" || die "failed to install ${name} to ${destination}"
 	[ -x "$destination" ] || die "installed ${destination} is not executable"
+	progress "installed ${name}"
 }
 
 run_daemon_install() {
 	elarkd_bin="${install_dir}/elarkd"
 	[ -x "$elarkd_bin" ] || die "installed ${elarkd_bin} is not executable"
 	if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+		progress "registering elarkd as a system service"
 		if [ "$(id -u)" -eq 0 ]; then
 			"$elarkd_bin" install --system || die "elarkd system install failed"
 		else
 			command_exists sudo || die "--system requires sudo"
 			sudo "$elarkd_bin" install --system || die "elarkd system install failed"
 		fi
+		progress "registered elarkd system service"
 		return
 	fi
+	progress "registering elarkd user service"
 	"$elarkd_bin" install || die "elarkd install failed"
+	progress "registered elarkd user service"
 }
+
+progress "starting installer for ${REPO}"
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/elark-install.XXXXXX") || die "failed to create temporary directory"
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
 goos=$(detect_os)
 goarch=$(detect_arch)
+progress "detected platform: ${goos}/${goarch}"
+progress "selecting install directory"
 install_dir=$(select_install_dir)
+progress "using install directory: ${install_dir}"
 
 release_json="${tmpdir}/release.json"
-download_to "$RELEASE_API_URL" "$release_json"
+download_to "$RELEASE_API_URL" "$release_json" "latest release metadata"
 
+progress "selecting release asset for ${goos}/${goarch}"
 asset_url=$(find_asset_url "$release_json" "$goos" "$goarch" || true)
 [ -n "$asset_url" ] || die "latest GitHub release has no asset for ${goos}/${goarch}"
 
 archive_name=${asset_url##*/}
 archive="${tmpdir}/${archive_name}"
-download_to "$asset_url" "$archive"
+progress "selected release asset: ${archive_name}"
+download_to "$asset_url" "$archive" "$archive_name"
 
 checksum_url=$(release_urls "$release_json" | grep -F "${archive_name}.sha256" | head -n 1 || true)
 if [ -n "$checksum_url" ]; then
 	checksum_file="${tmpdir}/${archive_name}.sha256"
-	download_to "$checksum_url" "$checksum_file"
+	download_to "$checksum_url" "$checksum_file" "${archive_name}.sha256"
 	verify_checksum "$checksum_file" "$archive"
+else
+	progress "no checksum asset found for ${archive_name}; skipping checksum verification"
 fi
 
 extract_dir="${tmpdir}/extract"
 mkdir -p "$extract_dir" || die "failed to create extraction directory"
+progress "extracting ${archive_name}"
 case "$archive_name" in
 	*.tar.gz | *.tgz)
 		command_exists tar || die "missing dependency: tar"
@@ -281,7 +308,9 @@ case "$archive_name" in
 		die "unsupported release archive: ${archive_name}"
 		;;
 esac
+progress "extracted ${archive_name}"
 
+progress "locating binaries in release archive"
 elark_source=$(find_extracted_binary "$extract_dir" elark)
 elarkd_source=$(find_extracted_binary "$extract_dir" elarkd)
 
@@ -290,7 +319,11 @@ install_binary "$elarkd_source" elarkd
 
 if [ "$AUTO_INSTALL" -eq 1 ]; then
 	run_daemon_install
+else
+	progress "skipping daemon service registration (--no-install)"
 fi
+
+progress "install complete"
 
 log ""
 log "exec-over-lark installed successfully."
