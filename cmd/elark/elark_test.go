@@ -50,6 +50,9 @@ func TestHostCommandUsesNonPTYByDefault(t *testing.T) {
 	if start.Cwd != "/srv/app" {
 		t.Fatalf("cwd = %q, want /srv/app", start.Cwd)
 	}
+	if start.Env["TERM"] != "" {
+		t.Fatalf("TERM env for non-PTY = %q, want empty", start.Env["TERM"])
+	}
 }
 
 func TestHostWithoutCommandAllocatesPTYByDefault(t *testing.T) {
@@ -67,6 +70,9 @@ func TestHostWithoutCommandAllocatesPTYByDefault(t *testing.T) {
 	start := fake.starts[0]
 	if start.Host != "macmini" || start.Cmd != "" || !start.Pty {
 		t.Fatalf("start request = %#v, want default PTY login shell", start)
+	}
+	if start.Env["TERM"] != "xterm-256color" {
+		t.Fatalf("TERM env = %q, want xterm-256color fallback", start.Env["TERM"])
 	}
 }
 
@@ -98,6 +104,18 @@ func TestTTYFlagsOverrideDefaults(t *testing.T) {
 			t.Fatalf("start request = %#v, want PTY disabled", fake.starts)
 		}
 	})
+}
+
+func TestTerminalEnvUsesLocalTermWithFallback(t *testing.T) {
+	if got := terminalEnv(func(string) string { return "xterm-ghostty" })["TERM"]; got != "xterm-ghostty" {
+		t.Fatalf("TERM = %q, want local term", got)
+	}
+	for _, value := range []string{"", "dumb"} {
+		got := terminalEnv(func(string) string { return value })["TERM"]
+		if got != "xterm-256color" {
+			t.Fatalf("TERM fallback for %q = %q, want xterm-256color", value, got)
+		}
+	}
 }
 
 func TestConfigSocketIsUsedWithoutPrintingSecret(t *testing.T) {
@@ -209,46 +227,6 @@ func TestInteractivePTYStreamsTerminalStdin(t *testing.T) {
 	}
 
 	_ = stdinWriter.Close()
-	fake.receiveCh <- ipc.ExitMessage("", 0)
-	if code := receiveExitCode(t, codeCh); code != 0 {
-		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
-	}
-	receiveClosed(t, rawState.restored)
-}
-
-func TestInteractivePTYNormalizesBackspaceAndBatchesEscapeSequence(t *testing.T) {
-	stdin := newChunkedReader()
-	fake := &fakeClient{
-		receiveCh: make(chan ipc.Message, 2),
-		startCh:   make(chan ipc.StartSessionRequest, 1),
-		stdinCh:   make(chan []byte, 1),
-	}
-	app, _, stderr := newTestApp(fake, stdin)
-	app.stdinIsTerminal = func(io.Reader) bool { return true }
-	rawState := &fakeTerminalState{restored: make(chan struct{}, 1)}
-	app.makeRawTerminal = func(io.Reader) (terminalRestorer, error) {
-		return rawState, nil
-	}
-	configPath := testCLIConfigPath(t)
-
-	codeCh := make(chan int, 1)
-	go func() {
-		codeCh <- app.run([]string{"--config", configPath, "--socket", "/tmp/elarkd.sock", "macmini"})
-	}()
-
-	receiveStart(t, fake.startCh)
-	fake.receiveCh <- ipc.StartAckMessage("")
-
-	stdin.write([]byte{'a'})
-	stdin.write([]byte{0x08})
-	stdin.write([]byte{0x1b})
-	stdin.write([]byte{'[', 'D'})
-	stdin.close()
-
-	if got := receiveBytes(t, fake.stdinCh); !bytes.Equal(got, []byte{'a', 0x7f, 0x1b, '[', 'D'}) {
-		t.Fatalf("forwarded stdin = % x, want normalized batched bytes", got)
-	}
-
 	fake.receiveCh <- ipc.ExitMessage("", 0)
 	if code := receiveExitCode(t, codeCh); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
@@ -508,6 +486,8 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 				return "24"
 			case "COLUMNS":
 				return "80"
+			case "TERM":
+				return ""
 			default:
 				return ""
 			}
@@ -528,30 +508,6 @@ func (s *fakeTerminalState) Restore() error {
 		s.restored <- struct{}{}
 	}
 	return nil
-}
-
-type chunkedReader struct {
-	ch chan []byte
-}
-
-func newChunkedReader() *chunkedReader {
-	return &chunkedReader{ch: make(chan []byte, 8)}
-}
-
-func (r *chunkedReader) Read(p []byte) (int, error) {
-	chunk, ok := <-r.ch
-	if !ok {
-		return 0, io.EOF
-	}
-	return copy(p, chunk), nil
-}
-
-func (r *chunkedReader) write(data []byte) {
-	r.ch <- append([]byte(nil), data...)
-}
-
-func (r *chunkedReader) close() {
-	close(r.ch)
 }
 
 type fakeSignalNotify struct {

@@ -32,8 +32,6 @@ const (
 	defaultSocketPath           = "~/.local/run/exec-over-lark/elarkd.sock"
 	clientInterruptExitCode     = 130
 	clientInterruptCloseTimeout = 2 * time.Second
-	rawTerminalStdinChunkBytes  = 32 * 1024
-	rawTerminalStdinFlushDelay  = 10 * time.Millisecond
 )
 
 type daemonClient interface {
@@ -371,6 +369,9 @@ func (a *app) runRemote(cmd parsedCommand) int {
 		Rows:       rows,
 		Cols:       cols,
 	}
+	if start.Pty {
+		start.Env = terminalEnv(a.getenv)
+	}
 	if strings.TrimSpace(start.Cwd) == "" && cfg != nil {
 		if host, ok := cfg.Hosts[cmd.host]; ok {
 			start.Cwd = host.DefaultCWD
@@ -583,26 +584,17 @@ func (a *app) forwardRawTerminalStdin(ctx context.Context, client daemonClient, 
 		})
 	}
 
-	type terminalRead struct {
-		data []byte
-		err  error
-	}
-	readCh := make(chan terminalRead, 16)
-
 	go func() {
-		defer close(readCh)
-		buf := make([]byte, rawTerminalStdinChunkBytes)
+		buf := make([]byte, 32*1024)
 		for {
 			n, err := a.stdin.Read(buf)
-			var data []byte
 			if n > 0 {
-				data = append([]byte(nil), buf[:n]...)
-			}
-			if len(data) > 0 || err != nil {
-				select {
-				case <-ctx.Done():
+				data := append([]byte(nil), buf[:n]...)
+				if ctx.Err() != nil {
 					return
-				case readCh <- terminalRead{data: data, err: err}:
+				}
+				if sendErr := client.SendStdin(ctx, requestID, data); sendErr != nil {
+					return
 				}
 			}
 			if err != nil {
@@ -610,90 +602,7 @@ func (a *app) forwardRawTerminalStdin(ctx context.Context, client daemonClient, 
 			}
 		}
 	}()
-
-	go func() {
-		var pending []byte
-		var timer *time.Timer
-		var timerC <-chan time.Time
-		stopTimer := func() {
-			if timer == nil {
-				return
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer = nil
-			timerC = nil
-		}
-		startTimer := func() {
-			if timer != nil {
-				return
-			}
-			timer = time.NewTimer(rawTerminalStdinFlushDelay)
-			timerC = timer.C
-		}
-		flush := func() bool {
-			stopTimer()
-			if len(pending) == 0 {
-				return true
-			}
-			data := normalizeRawTerminalInput(pending)
-			pending = nil
-			if ctx.Err() != nil {
-				return false
-			}
-			return client.SendStdin(ctx, requestID, data) == nil
-		}
-		defer stopTimer()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case read, ok := <-readCh:
-				if !ok {
-					flush()
-					return
-				}
-				if len(read.data) > 0 {
-					pending = append(pending, read.data...)
-					if len(pending) >= rawTerminalStdinChunkBytes {
-						if !flush() {
-							return
-						}
-					} else {
-						startTimer()
-					}
-				}
-				if read.err != nil {
-					flush()
-					return
-				}
-			case <-timerC:
-				timer = nil
-				timerC = nil
-				if !flush() {
-					return
-				}
-			}
-		}
-	}()
 	return restore, nil
-}
-
-func normalizeRawTerminalInput(data []byte) []byte {
-	out := append([]byte(nil), data...)
-	for i := range out {
-		// Some terminals send Ctrl-H for Backspace. The remote PTY default
-		// erase character is DEL, so normalize the indistinguishable key byte.
-		if out[i] == 0x08 {
-			out[i] = 0x7f
-		}
-	}
-	return out
 }
 
 func shouldCloseOnInterrupt(pty bool, startAcked <-chan struct{}) bool {
@@ -1197,6 +1106,17 @@ func makeRawTerminal(r io.Reader) (terminalRestorer, error) {
 		return nil, errors.New("stdin is not a terminal file")
 	}
 	return pty.MakeRaw(int(file.Fd()))
+}
+
+func terminalEnv(getenv func(string) string) map[string]string {
+	term := ""
+	if getenv != nil {
+		term = strings.TrimSpace(getenv("TERM"))
+	}
+	if term == "" || term == "dumb" {
+		term = "xterm-256color"
+	}
+	return map[string]string{"TERM": term}
 }
 
 func terminalSizeFromEnv(getenv func(string) string) (int, int) {
