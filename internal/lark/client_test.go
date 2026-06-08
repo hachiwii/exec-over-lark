@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,53 @@ func TestTenantTokenAndBotOpenIDAreCached(t *testing.T) {
 	}
 	if botRequests != 1 {
 		t.Fatalf("botRequests = %d, want 1", botRequests)
+	}
+}
+
+func TestIsRetryableSendError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "http 5xx",
+			err:  &APIError{Status: 500, Path: sendMessagePath},
+			want: true,
+		},
+		{
+			name: "rate limited 230020",
+			err:  &APIError{Status: 429, Code: 230020, Path: sendMessagePath},
+			want: true,
+		},
+		{
+			name: "other 4xx",
+			err:  &APIError{Status: 403, Code: 999, Path: sendMessagePath},
+		},
+		{
+			name: "business code without 4xx",
+			err:  &APIError{Code: 230020, Path: sendMessagePath},
+		},
+		{
+			name: "network error",
+			err:  &url.Error{Op: "Post", URL: "https://open.feishu.cn", Err: errors.New("connection reset")},
+			want: true,
+		},
+		{
+			name: "context canceled",
+			err:  context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			err:  context.DeadlineExceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsRetryableSendError(tt.err); got != tt.want {
+				t.Fatalf("IsRetryableSendError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -3,8 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"reflect"
 	"sync"
 	"testing"
@@ -41,8 +39,8 @@ func TestLocalRunLoadsConfigStartsIPCAndEventSource(t *testing.T) {
 			fakeIPC.handler = handler
 			return fakeIPC, nil
 		},
-		TickInterval:  time.Hour,
-		FlushInterval: time.Hour,
+		Outbound:     newTestOutboundManager(t, fakeLark),
+		TickInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("NewLocal returned error: %v", err)
@@ -144,6 +142,7 @@ func TestStartLocalSessionCreatesRootMessageAndSendsControls(t *testing.T) {
 	if err := local.Stdin(context.Background(), ipc.StdinRequest{RequestID: "req-1", Bytes: []byte("hello\n")}); err != nil {
 		t.Fatalf("Stdin returned error: %v", err)
 	}
+	waitRepliesLen(t, fakeLark, 1)
 	if len(fakeLark.replies) != 1 {
 		t.Fatalf("replies = %d, want 1", len(fakeLark.replies))
 	}
@@ -223,81 +222,14 @@ func TestHandleLarkEventIgnoresUnconfiguredPeer(t *testing.T) {
 	}
 }
 
-func TestLocalFlushLoopDropsConnectionAfterRepeatedSendFailures(t *testing.T) {
-	wantErr := errors.New("lark unavailable")
-	sender := &retryOutboundSender{calls: make(chan error, outboundFlushMaxFailures+1)}
-	queue := outbound.New(sender, outbound.WithSendCooldown(time.Millisecond))
-	manager := session.New(session.WithOutboundQueue(queue))
-	sub := &fakeSubscriber{}
-	if err := manager.RegisterLocal(session.LocalStart{
-		RequestID:     "req-1",
-		ConnID:        "om_root",
-		RootMessageID: "om_root",
-		ChatID:        "oc_chat",
-		PeerBotOpenID: "ou_peer_bot",
-		NextSendSeq:   1,
-	}, sub); err != nil {
-		t.Fatalf("RegisterLocal returned error: %v", err)
-	}
-	target := outbound.Target{
-		ChatID:        "oc_chat",
-		RootMessageID: "om_root",
-		MentionOpenID: "ou_peer_bot",
-	}
-	if err := queue.Enqueue(context.Background(), target, protocol.Frame{Seq: 1, Type: protocol.TypeStdin, Payload: []byte("prime")}); err != nil {
-		t.Fatalf("prime Enqueue returned error: %v", err)
-	}
-	if err := waitRetryOutboundSenderCall(sender.calls); err != nil {
-		t.Fatalf("prime send returned error: %v", err)
-	}
-	if err := manager.SendLocalStdin(context.Background(), "req-1", []byte("queued input")); err != nil {
-		t.Fatalf("SendLocalStdin returned error: %v", err)
-	}
-	if got := queue.PendingLen(); got != 1 {
-		t.Fatalf("PendingLen before flushLoop = %d, want 1", got)
-	}
-
-	sender.setErrors(wantErr, wantErr, wantErr)
-	local := &Local{
-		queue:         queue,
-		sessions:      manager,
-		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		flushInterval: time.Millisecond,
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- local.flushLoop(ctx)
-	}()
-
-	for i := 0; i < outboundFlushMaxFailures; i++ {
-		if err := waitRetryOutboundSenderCall(sender.calls); !errors.Is(err, wantErr) {
-			t.Fatalf("flush call %d error = %v, want %v", i+1, err, wantErr)
-		}
-	}
-	waitLocalSessionsLen(t, manager, 0)
-	if !sub.closed {
-		t.Fatal("local subscriber was not closed")
-	}
-	if got := queue.PendingLen(); got != 0 {
-		t.Fatalf("PendingLen after drop = %d, want 0", got)
-	}
-
-	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
-		t.Fatalf("flushLoop exit error = %v, want context.Canceled", err)
-	}
-}
-
 func newTestLocal(t *testing.T, cfg *config.Config, client *fakeLarkClient) *Local {
 	t.Helper()
 	local, err := NewLocal(LocalOptions{
-		Config:        cfg,
-		LarkClient:    client,
-		EventSource:   NoopEventSource{},
-		TickInterval:  time.Hour,
-		FlushInterval: time.Hour,
+		Config:       cfg,
+		LarkClient:   client,
+		EventSource:  NoopEventSource{},
+		Outbound:     newTestOutboundManager(t, client),
+		TickInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("NewLocal returned error: %v", err)
@@ -360,84 +292,69 @@ func (c *fakeLarkClient) ReplyRootMessage(_ context.Context, chatID, rootMessage
 	return "om_reply", nil
 }
 
-type retryOutboundSender struct {
-	mu      sync.Mutex
-	errs    []error
-	calls   chan error
-	replies []sentMessage
+type testOutboundSender struct {
+	client *fakeLarkClient
 }
 
-func (s *retryOutboundSender) SendRootMessage(ctx context.Context, chatID, mentionOpenID, text string) (outbound.RootMessage, error) {
-	if err := ctx.Err(); err != nil {
+func (s testOutboundSender) SendRootMessage(ctx context.Context, _ outbound.Role, chatID, mentionOpenID, text string) (outbound.RootMessage, error) {
+	root, err := s.client.SendRootMessage(ctx, chatID, mentionOpenID, text)
+	if err != nil {
 		return outbound.RootMessage{}, err
 	}
-	return outbound.RootMessage{MessageID: "om_root"}, s.record(sentMessage{
-		chatID:        chatID,
-		mentionOpenID: mentionOpenID,
-		text:          text,
-	})
+	return outbound.RootMessage{MessageID: root.MessageID}, nil
 }
 
-func (s *retryOutboundSender) ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	err := s.record(sentMessage{
-		chatID:        chatID,
-		rootMessageID: rootMessageID,
-		mentionOpenID: mentionOpenID,
-		text:          text,
+func (s testOutboundSender) ReplyRootMessage(ctx context.Context, _ outbound.Role, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
+	return s.client.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
+}
+
+func newTestOutboundManager(t *testing.T, client *fakeLarkClient) *outbound.Manager {
+	t.Helper()
+	manager, err := outbound.NewManager(outbound.ManagerOptions{
+		Sender:            testOutboundSender{client: client},
+		SendCooldown:      time.Millisecond,
+		RequestLimitBytes: config.DefaultLarkTextRequestLimitBytes,
 	})
 	if err != nil {
-		return "", err
+		t.Fatalf("NewManager returned error: %v", err)
 	}
-	return "om_reply", nil
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		_ = manager.Run(ctx)
+	}()
+	return manager
 }
 
-func (s *retryOutboundSender) record(msg sentMessage) error {
-	s.mu.Lock()
-	s.replies = append(s.replies, msg)
-	var err error
-	if len(s.errs) > 0 {
-		err = s.errs[0]
-		s.errs = s.errs[1:]
-	}
-	s.mu.Unlock()
-
-	if s.calls != nil {
-		s.calls <- err
-	}
-	return err
-}
-
-func (s *retryOutboundSender) setErrors(errs ...error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.errs = append([]error(nil), errs...)
-}
-
-func waitRetryOutboundSenderCall(c <-chan error) error {
-	select {
-	case err := <-c:
-		return err
-	case <-time.After(2 * time.Second):
-		return errors.New("timed out waiting for outbound send")
-	}
-}
-
-func waitLocalSessionsLen(t *testing.T, manager *session.Manager, want int) {
+func waitRepliesLen(t *testing.T, client *fakeLarkClient, want int) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
-
 	for {
-		if got := len(manager.LocalSessions()); got == want {
+		if len(client.replies) >= want {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("LocalSessions did not become %d, got %d", want, len(manager.LocalSessions()))
+			t.Fatalf("replies did not reach %d, got %d", want, len(client.replies))
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitReplyFramesLen(t *testing.T, client *fakeLarkClient, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if len(remoteReplyFrames(t, client)) >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("reply frames did not reach %d, got %d", want, len(remoteReplyFrames(t, client)))
 		case <-ticker.C:
 		}
 	}

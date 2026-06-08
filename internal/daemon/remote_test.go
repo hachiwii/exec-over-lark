@@ -6,20 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"os"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
-	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/hachiwii/exec-over-lark/internal/protocol"
 	"github.com/hachiwii/exec-over-lark/internal/remoteexec"
-	"github.com/hachiwii/exec-over-lark/internal/session"
 )
 
 func TestRemoteRunConsumesStartExecutesAndRepliesFrames(t *testing.T) {
@@ -66,9 +61,7 @@ func TestRemoteRunConsumesStartExecutesAndRepliesFrames(t *testing.T) {
 	if gotReq.Command != "printf hello" || gotReq.Shell != "/bin/sh" || gotReq.Cwd != "/srv/app" || gotReq.Env["LANG"] != "C" {
 		t.Fatalf("executor request = %#v", gotReq)
 	}
-	if len(fakeLark.replies) < 4 {
-		t.Fatalf("replies = %d, want start_ack, output, and exit frames", len(fakeLark.replies))
-	}
+	waitReplyFramesLen(t, fakeLark, 4)
 	for _, reply := range fakeLark.replies {
 		if reply.chatID != "oc_chat" || reply.rootMessageID != "om_root" || reply.mentionOpenID != "ou_client" {
 			t.Fatalf("reply target = %#v, want oc_chat/om_root/ou_client", reply)
@@ -180,6 +173,7 @@ func TestRemoteRunRepliesErrorWhenExecutorCannotStart(t *testing.T) {
 	if err := remote.Run(context.Background()); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
+	waitReplyFramesLen(t, fakeLark, 2)
 	frames := remoteReplyFrames(t, fakeLark)
 	gotTypes := remoteFrameTypes(frames)
 	wantTypes := []protocol.FrameType{protocol.TypeStartAck, protocol.TypeError}
@@ -195,138 +189,21 @@ func TestRemoteRunRepliesErrorWhenExecutorCannotStart(t *testing.T) {
 	}
 }
 
-func TestRemoteFlushLoopRetriesAfterSendFailure(t *testing.T) {
-	wantErr := errors.New("lark unavailable")
-	sender := &retryRemoteSender{calls: make(chan error, 4)}
-	queue := outbound.New(
-		replyOnlyOutboundSender{sender: sender},
-		outbound.WithSendCooldown(10*time.Millisecond),
-	)
-	target := outbound.Target{
-		ChatID:        "oc_chat",
-		RootMessageID: "om_root",
-		MentionOpenID: "ou_client",
-	}
-
-	if err := queue.Enqueue(context.Background(), target, protocol.Frame{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("prime")}); err != nil {
-		t.Fatalf("prime Enqueue returned error: %v", err)
-	}
-	if err := waitRetrySenderCall(sender.calls); err != nil {
-		t.Fatalf("prime send returned error: %v", err)
-	}
-	if err := queue.Enqueue(context.Background(), target, protocol.Frame{Seq: 2, Type: protocol.TypeStdout, Payload: []byte("retry me")}); err != nil {
-		t.Fatalf("queued Enqueue returned error: %v", err)
-	}
-	if got := queue.PendingLen(); got != 1 {
-		t.Fatalf("PendingLen before flushLoop = %d, want 1", got)
-	}
-
-	sender.setErrors(wantErr, nil)
-	remote := &RemoteDaemon{
-		queue:  queue,
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- remote.flushLoop(ctx)
-	}()
-
-	if err := waitRetrySenderCall(sender.calls); !errors.Is(err, wantErr) {
-		t.Fatalf("first flush error = %v, want %v", err, wantErr)
-	}
-	if got := queue.PendingLen(); got != 1 {
-		t.Fatalf("PendingLen after failed flush = %d, want 1", got)
-	}
-	if err := waitRetrySenderCall(sender.calls); err != nil {
-		t.Fatalf("retry flush returned error: %v", err)
-	}
-	waitQueuePendingLen(t, queue, 0)
-
-	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
-		t.Fatalf("flushLoop exit error = %v, want context.Canceled", err)
-	}
-}
-
-func TestRemoteFlushLoopDropsConnectionAfterRepeatedSendFailures(t *testing.T) {
-	wantErr := errors.New("lark unavailable")
-	sender := &retryRemoteSender{calls: make(chan error, outboundFlushMaxFailures+1)}
-	queue := outbound.New(
-		replyOnlyOutboundSender{sender: sender},
-		outbound.WithSendCooldown(time.Millisecond),
-	)
-	manager := session.New(session.WithOutboundQueue(queue))
-	receiver := &closeTrackingRemoteReceiver{}
-	start := jsonFrame(t, 1, protocol.TypeStart, protocol.StartPayload{Cmd: "sleep 60"})
-	if _, err := manager.AcceptRemoteStart(context.Background(), session.InboundMessage{
-		ConnID:        "om_root",
-		RootMessageID: "om_root",
-		MessageID:     "om_root",
-		ChatID:        "oc_chat",
-		SenderOpenID:  "ou_client",
-		IsRoot:        true,
-		Frames:        []protocol.Frame{start},
-	}, receiver); err != nil {
-		t.Fatalf("AcceptRemoteStart returned error: %v", err)
-	}
-	if err := waitRetrySenderCall(sender.calls); err != nil {
-		t.Fatalf("start ack send returned error: %v", err)
-	}
-	if err := manager.SendRemoteStdout(context.Background(), "om_root", []byte("queued output")); err != nil {
-		t.Fatalf("SendRemoteStdout returned error: %v", err)
-	}
-	if got := queue.PendingLen(); got != 1 {
-		t.Fatalf("PendingLen before flushLoop = %d, want 1", got)
-	}
-
-	sender.setErrors(wantErr, wantErr, wantErr)
-	remote := &RemoteDaemon{
-		queue:   queue,
-		manager: manager,
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- remote.flushLoop(ctx)
-	}()
-
-	for i := 0; i < outboundFlushMaxFailures; i++ {
-		if err := waitRetrySenderCall(sender.calls); !errors.Is(err, wantErr) {
-			t.Fatalf("flush call %d error = %v, want %v", i+1, err, wantErr)
-		}
-	}
-	waitRemoteSessionsLen(t, manager, 0)
-	if !receiver.closed {
-		t.Fatal("remote receiver was not closed")
-	}
-	if got := queue.PendingLen(); got != 0 {
-		t.Fatalf("PendingLen after drop = %d, want 0", got)
-	}
-
-	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
-		t.Fatalf("flushLoop exit error = %v, want context.Canceled", err)
-	}
-}
-
 func newTestRemote(t *testing.T, stream io.Reader, sender *fakeLarkClient, executor *fakeRemoteExecutor, cfg RemoteConfig) *RemoteDaemon {
 	t.Helper()
 	if cfg.LarkTextRequestLimitBytes == 0 {
 		cfg.LarkTextRequestLimitBytes = config.DefaultLarkTextRequestLimitBytes
 	}
-	remote, err := NewRemoteDaemon(RemoteOptions{
+	remote, err := NewRemote(RemoteOptions{
 		Config:        cfg,
 		EventStream:   stream,
 		SelfBotOpenID: "ou_self_bot",
 		Sender:        sender,
 		Executor:      executor,
+		Outbound:      newTestOutboundManager(t, sender),
 	})
 	if err != nil {
-		t.Fatalf("NewRemoteDaemon returned error: %v", err)
+		t.Fatalf("NewRemote returned error: %v", err)
 	}
 	return remote
 }
@@ -466,101 +343,6 @@ func remoteReplyFrames(t *testing.T, sender *fakeLarkClient) []protocol.Frame {
 		out = append(out, decodeFrames(t, reply.text)...)
 	}
 	return out
-}
-
-type retryRemoteSender struct {
-	mu      sync.Mutex
-	errs    []error
-	replies []sentMessage
-	calls   chan error
-}
-
-type closeTrackingRemoteReceiver struct {
-	closed bool
-}
-
-func (r *closeTrackingRemoteReceiver) Deliver(context.Context, session.RemoteEvent) error {
-	return nil
-}
-
-func (r *closeTrackingRemoteReceiver) Close() error {
-	r.closed = true
-	return nil
-}
-
-func (s *retryRemoteSender) ReplyRootMessage(_ context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
-	s.mu.Lock()
-	s.replies = append(s.replies, sentMessage{
-		chatID:        chatID,
-		rootMessageID: rootMessageID,
-		mentionOpenID: mentionOpenID,
-		text:          text,
-	})
-	var err error
-	if len(s.errs) > 0 {
-		err = s.errs[0]
-		s.errs = s.errs[1:]
-	}
-	s.mu.Unlock()
-
-	if s.calls != nil {
-		s.calls <- err
-	}
-	if err != nil {
-		return "", err
-	}
-	return "om_reply", nil
-}
-
-func (s *retryRemoteSender) setErrors(errs ...error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.errs = append([]error(nil), errs...)
-}
-
-func waitRetrySenderCall(c <-chan error) error {
-	select {
-	case err := <-c:
-		return err
-	case <-time.After(2 * time.Second):
-		return errors.New("timed out waiting for reply send")
-	}
-}
-
-func waitQueuePendingLen(t *testing.T, queue *outbound.Queue, want int) {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if got := queue.PendingLen(); got == want {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("PendingLen did not become %d, got %d", want, queue.PendingLen())
-		case <-ticker.C:
-		}
-	}
-}
-
-func waitRemoteSessionsLen(t *testing.T, manager *session.Manager, want int) {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if got := len(manager.RemoteSessions()); got == want {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("RemoteSessions did not become %d, got %d", want, len(manager.RemoteSessions()))
-		case <-ticker.C:
-		}
-	}
 }
 
 func remoteFrameTypes(frames []protocol.Frame) []protocol.FrameType {

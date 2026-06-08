@@ -18,7 +18,7 @@ const (
 	DefaultConfigDir  = ".elark"
 	DefaultConfigFile = "config.toml"
 
-	DefaultSendCooldown              = time.Second
+	DefaultSendCooldown              = 500 * time.Millisecond
 	DefaultLarkTextRequestLimitBytes = 153600
 	DefaultHeartbeatInterval         = 10 * time.Second
 	DefaultHeartbeatTimeout          = 30 * time.Second
@@ -503,7 +503,7 @@ socket_path = "~/.local/run/exec-over-lark/elarkd.sock"
 [lark]
 app_id = "cli_client_xxx"
 app_secret = "client_secret_xxx"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]
@@ -530,7 +530,7 @@ socket_path = "~/.local/run/exec-over-lark/elarkd.sock"
 [lark]
 app_id = "cli_server_xxx"
 app_secret = "server_secret_xxx"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]

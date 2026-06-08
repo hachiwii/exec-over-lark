@@ -127,7 +127,7 @@ socket_path = "~/.local/run/exec-over-lark/elarkd.sock"
 [lark]
 app_id = "cli_client_xxx"
 app_secret = "client_secret_xxx"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]
@@ -159,7 +159,7 @@ stream_chunk_bytes = 12000
 - `ipc.enabled = true`：启动本地 client 服务，允许 `elark` CLI 通过本地 Unix socket 调用本地 daemon。
 - `ipc.socket_path`：本地 daemon socket 路径，所在目录权限不能宽于 `0700`。
 - `lark.app_id` / `lark.app_secret`：client bot 的凭据。
-- `lark.send_cooldown`：两次飞书发送之间的最小间隔，默认 `"1000ms"`。
+- `lark.send_cooldown`：同一 chat 内两次飞书发送之间的最小间隔，默认 `"500ms"`；不同 chat 的发送冷却彼此独立。
 - `lark.lark_text_request_limit_bytes`：飞书文本消息请求体上限，第一版固定为 `153600`。
 - `connection.heartbeat_interval`：连接空闲多久后发送 heartbeat，默认 `"10s"`。
 - `connection.heartbeat_timeout`：声明给对端的超时时间，默认 `"30s"`。
@@ -183,7 +183,7 @@ socket_path = "~/.local/run/exec-over-lark/elarkd.sock"
 [lark]
 app_id = "cli_server_xxx"
 app_secret = "server_secret_xxx"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]
@@ -364,9 +364,9 @@ go build ./cmd/elarkd
 - `internal/config`：TOML 配置、默认路径、模板生成和权限检查。
 - `internal/ipc`：本地 Unix socket 协议。
 - `internal/lark`：飞书 OpenAPI client、token、bot OpenID、bot 入群检查和消息发送。
-- `internal/outbound`：发送队列、限流、聚合和拆分。
+- `internal/outbound`：按 chat 共享的发送调度、限流、聚合、重试和 heartbeat。
 - `internal/protocol`：`EOL1` frame 编解码。
-- `internal/session`：连接、序列窗口、heartbeat 和 session 分发。
+- `internal/session`：连接、序列窗口、peer timeout 和 session 分发。
 - `internal/remoteexec`：远端非交互命令执行。
 - `internal/pty`：Unix PTY 和终端控制。
 - `internal/bootstrap`：server bot 入群 bootstrap 消息。

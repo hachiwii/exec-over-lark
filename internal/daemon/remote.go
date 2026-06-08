@@ -23,10 +23,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/session"
 )
 
-const (
-	defaultRemoteEventBuffer   = 128
-	defaultRemoteFlushInterval = 100 * time.Millisecond
-)
+const defaultRemoteEventBuffer = 128
 
 var (
 	ErrRemoteExecDisabled  = errors.New("remote exec is disabled")
@@ -76,6 +73,7 @@ type RemoteOptions struct {
 	Sender        RemoteSender
 	Executor      RemoteExecutor
 	Logger        *slog.Logger
+	Outbound      *outbound.Manager
 }
 
 type RemoteDaemon struct {
@@ -87,8 +85,8 @@ type RemoteDaemon struct {
 	executor      RemoteExecutor
 	logger        *slog.Logger
 
-	queue   *outbound.Queue
-	manager *session.Manager
+	outbound *outbound.Manager
+	manager  *session.Manager
 
 	allowedChats   map[string]struct{}
 	allowedSenders map[string]struct{}
@@ -117,7 +115,7 @@ func RemoteConfigFromConfig(cfg *config.Config) RemoteConfig {
 	}
 }
 
-func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
+func NewRemote(opts RemoteOptions) (*RemoteDaemon, error) {
 	cfg := normalizeRemoteConfig(opts.Config)
 	if !cfg.ExecEnabled {
 		return nil, ErrRemoteExecDisabled
@@ -131,6 +129,9 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 	if opts.Sender == nil {
 		return nil, ErrRemoteMissingSender
 	}
+	if opts.Outbound == nil {
+		return nil, errors.New("outbound manager is nil")
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -143,13 +144,8 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 		executor = remoteexecAdapter{executor: remoteexec.New(cfg.DefaultShell)}
 	}
 
-	queue := outbound.New(
-		replyOnlyOutboundSender{sender: opts.Sender},
-		outbound.WithSendCooldown(cfg.SendCooldown),
-		outbound.WithRequestLimitBytes(cfg.LarkTextRequestLimitBytes),
-	)
 	manager := session.New(
-		session.WithOutboundQueue(queue),
+		session.WithOutbound(opts.Outbound),
 		session.WithHeartbeatInterval(cfg.HeartbeatInterval),
 		session.WithHeartbeatTimeout(cfg.HeartbeatTimeout),
 		session.WithSequenceGapTimeout(cfg.SequenceGapTimeout),
@@ -164,7 +160,7 @@ func NewRemoteDaemon(opts RemoteOptions) (*RemoteDaemon, error) {
 		sender:         opts.Sender,
 		executor:       executor,
 		logger:         logger,
-		queue:          queue,
+		outbound:       opts.Outbound,
 		manager:        manager,
 		allowedChats:   stringSet(cfg.AllowedChatIDs),
 		allowedSenders: stringSet(cfg.AllowedSenderOpenIDs),
@@ -193,13 +189,6 @@ func (d *RemoteDaemon) run(ctx context.Context, runEventSource bool) error {
 	loops.Add(1)
 	go func() {
 		defer loops.Done()
-		if err := d.flushLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
-			errCh <- err
-		}
-	}()
-	loops.Add(1)
-	go func() {
-		defer loops.Done()
 		if err := d.tickLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
 			errCh <- err
 		}
@@ -223,9 +212,6 @@ func (d *RemoteDaemon) run(ctx context.Context, runEventSource bool) error {
 		cancel()
 	}
 	d.wg.Wait()
-	if err == nil {
-		err = d.flushPending(ctx)
-	}
 	cancel()
 	loops.Wait()
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -367,74 +353,6 @@ func (d *RemoteDaemon) unregisterTask(connID string) {
 	delete(d.tasks, connID)
 }
 
-func (d *RemoteDaemon) flushLoop(ctx context.Context) error {
-	timer := time.NewTimer(defaultRemoteFlushInterval)
-	defer timer.Stop()
-	failures := newFlushFailureTracker()
-	retryWait := time.Duration(0)
-
-	for {
-		target, hasTarget := d.queue.FrontTarget()
-		flushed, err := d.queue.FlushReady(ctx)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if hasTarget && failures.record(target) >= outboundFlushMaxFailures {
-				d.dropFailedRemoteTarget(err, failures)
-				retryWait = 0
-				continue
-			}
-			retryWait = nextOutboundFlushRetryWait(retryWait)
-			d.logger.Warn("remote outbound flush failed; retrying", "error", err, "retry_in", retryWait)
-			if err := waitFlushRetry(ctx, timer, retryWait); err != nil {
-				return err
-			}
-			continue
-		}
-		if flushed {
-			if hasTarget {
-				failures.reset(target)
-			}
-			retryWait = 0
-			continue
-		}
-
-		wait := defaultRemoteFlushInterval
-		if next, ok := d.queue.NextFlushAt(); ok {
-			wait = time.Until(next)
-			if wait < 0 {
-				wait = 0
-			}
-		}
-		if wait <= 0 {
-			wait = defaultRemoteFlushInterval
-		}
-		if err := waitFlushRetry(ctx, timer, wait); err != nil {
-			return err
-		}
-	}
-}
-
-func (d *RemoteDaemon) dropFailedRemoteTarget(cause error, failures *flushFailureTracker) {
-	dropped, frameCount, ok := d.queue.DropFrontTarget()
-	if !ok {
-		return
-	}
-	failures.reset(dropped)
-	if strings.TrimSpace(dropped.RootMessageID) != "" {
-		d.manager.CloseRemoteConn(dropped.RootMessageID)
-	}
-	d.logger.Warn(
-		"remote outbound flush failed too many times; dropped connection",
-		"chat_id", dropped.ChatID,
-		"root_message_id", dropped.RootMessageID,
-		"mention_open_id", dropped.MentionOpenID,
-		"frames", frameCount,
-		"error", cause,
-	)
-}
-
 func (d *RemoteDaemon) tickLoop(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -447,34 +365,6 @@ func (d *RemoteDaemon) tickLoop(ctx context.Context) error {
 			_ = d.manager.Tick(ctx)
 		}
 	}
-}
-
-func (d *RemoteDaemon) flushPending(ctx context.Context) error {
-	for d.queue.PendingLen() > 0 {
-		flushed, err := d.queue.FlushReady(ctx)
-		if err != nil {
-			return err
-		}
-		if flushed {
-			continue
-		}
-		next, ok := d.queue.NextFlushAt()
-		if !ok {
-			return nil
-		}
-		wait := time.Until(next)
-		if wait < 0 {
-			wait = 0
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return nil
 }
 
 type remoteTask struct {
@@ -761,18 +651,6 @@ type remoteexecAdapter struct {
 
 func (a remoteexecAdapter) Start(ctx context.Context, req remoteexec.Request) (RemoteProcess, error) {
 	return a.executor.Start(ctx, req)
-}
-
-type replyOnlyOutboundSender struct {
-	sender RemoteSender
-}
-
-func (s replyOnlyOutboundSender) SendRootMessage(context.Context, string, string, string) (outbound.RootMessage, error) {
-	return outbound.RootMessage{}, errors.New("remote daemon cannot send root messages")
-}
-
-func (s replyOnlyOutboundSender) ReplyRootMessage(ctx context.Context, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
-	return s.sender.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
 }
 
 type remoteEventMeta struct {

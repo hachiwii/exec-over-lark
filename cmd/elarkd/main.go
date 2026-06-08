@@ -14,6 +14,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/daemon"
 	"github.com/hachiwii/exec-over-lark/internal/lark"
+	"github.com/hachiwii/exec-over-lark/internal/outbound"
 )
 
 func main() {
@@ -21,10 +22,6 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	if os.Getenv(loopbackE2EEnv) == "1" {
-		return runLoopbackE2E(args, stdout, stderr)
-	}
-
 	if len(args) > 0 && args[0] == "init" {
 		return runInit(args[1:], stdout, stderr)
 	}
@@ -73,12 +70,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
+	outboundMgr, err := outbound.NewManager(outbound.ManagerOptions{
+		Sender:            larkOutboundSender{client: larkClient},
+		SendCooldown:      cfg.Lark.SendCooldown.Duration(),
+		RequestLimitBytes: cfg.Lark.LarkTextRequestLimitBytes,
+		HeartbeatInterval: cfg.Connection.HeartbeatInterval.Duration(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "elarkd: %v\n", err)
+		return 1
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := outboundMgr.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
+			errCh <- err
+		}
+	}()
 
 	if cfg.IPC.Enabled {
 		local, err := daemon.NewLocal(daemon.LocalOptions{
 			Config:      cfg,
 			LarkClient:  larkClient,
 			EventSource: daemon.NoopEventSource{},
+			Outbound:    outboundMgr,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "elarkd: %v\n", err)
@@ -96,11 +111,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	if cfg.Exec.Enabled {
 		eventSource.bootstrapSender = larkClient
-		remote, err := daemon.NewRemoteDaemon(daemon.RemoteOptions{
+		remote, err := daemon.NewRemote(daemon.RemoteOptions{
 			Config:        daemon.RemoteConfigFromConfig(cfg),
 			EventSource:   eventSource,
 			SelfBotOpenID: selfOpenID,
 			Sender:        larkClient,
+			Outbound:      outboundMgr,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "elarkd: %v\n", err)
@@ -141,6 +157,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+type larkOutboundSender struct {
+	client *lark.Client
+}
+
+func (s larkOutboundSender) SendRootMessage(ctx context.Context, _ outbound.Role, chatID, mentionOpenID, text string) (outbound.RootMessage, error) {
+	root, err := s.client.SendRootMessage(ctx, chatID, mentionOpenID, text)
+	if err != nil {
+		return outbound.RootMessage{}, err
+	}
+	return outbound.RootMessage{MessageID: root.MessageID}, nil
+}
+
+func (s larkOutboundSender) ReplyRootMessage(ctx context.Context, _ outbound.Role, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
+	return s.client.ReplyRootMessage(ctx, chatID, rootMessageID, mentionOpenID, text)
 }
 
 type namedEventHandler struct {

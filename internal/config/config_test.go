@@ -132,7 +132,7 @@ peer_bot_open_id = "ou_server"
 	if cfg.Path != path {
 		t.Fatalf("Path = %q, want %q", cfg.Path, path)
 	}
-	if cfg.Lark.SendCooldown.Duration() != time.Second {
+	if cfg.Lark.SendCooldown.Duration() != 500*time.Millisecond {
 		t.Fatalf("SendCooldown = %s", cfg.Lark.SendCooldown)
 	}
 	if cfg.Lark.LarkTextRequestLimitBytes != 153600 {
@@ -385,7 +385,7 @@ enabled = false
 [lark]
 app_id = "cli_server_xxx"
 app_secret = "redacted"
-send_cooldown = "1000ms"
+send_cooldown = "500ms"
 lark_text_request_limit_bytes = 153600
 
 [connection]

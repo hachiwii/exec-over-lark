@@ -70,9 +70,9 @@ type LocalOptions struct {
 	EventSource EventSource
 	IPCListen   IPCListenFunc
 	Logger      *slog.Logger
+	Outbound    *outbound.Manager
 
-	TickInterval  time.Duration
-	FlushInterval time.Duration
+	TickInterval time.Duration
 }
 
 type Local struct {
@@ -82,10 +82,9 @@ type Local struct {
 	ipcListen   IPCListenFunc
 	logger      *slog.Logger
 
-	tickInterval  time.Duration
-	flushInterval time.Duration
+	tickInterval time.Duration
 
-	queue    *outbound.Queue
+	outbound *outbound.Manager
 	sessions *session.Manager
 
 	selfBotOpenID string
@@ -145,23 +144,16 @@ func NewLocal(opts LocalOptions) (*Local, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if opts.Outbound == nil {
+		return nil, errors.New("outbound manager is nil")
+	}
 
 	tickInterval := opts.TickInterval
 	if tickInterval <= 0 {
 		tickInterval = time.Second
 	}
-	flushInterval := opts.FlushInterval
-	if flushInterval <= 0 {
-		flushInterval = 100 * time.Millisecond
-	}
-
-	queue := outbound.New(
-		queueSender{client: client},
-		outbound.WithSendCooldown(cfg.Lark.SendCooldown.Duration()),
-		outbound.WithRequestLimitBytes(cfg.Lark.LarkTextRequestLimitBytes),
-	)
 	sessions := session.New(
-		session.WithOutboundQueue(queue),
+		session.WithOutbound(opts.Outbound),
 		session.WithHeartbeatInterval(cfg.Connection.HeartbeatInterval.Duration()),
 		session.WithHeartbeatTimeout(cfg.Connection.HeartbeatTimeout.Duration()),
 		session.WithSequenceGapTimeout(cfg.Connection.SequenceGapTimeout.Duration()),
@@ -169,15 +161,14 @@ func NewLocal(opts LocalOptions) (*Local, error) {
 	)
 
 	return &Local{
-		cfg:           cfg,
-		client:        client,
-		eventSource:   eventSource,
-		ipcListen:     ipcListen,
-		logger:        logger,
-		tickInterval:  tickInterval,
-		flushInterval: flushInterval,
-		queue:         queue,
-		sessions:      sessions,
+		cfg:          cfg,
+		client:       client,
+		eventSource:  eventSource,
+		ipcListen:    ipcListen,
+		logger:       logger,
+		tickInterval: tickInterval,
+		outbound:     opts.Outbound,
+		sessions:     sessions,
 	}, nil
 }
 
@@ -261,14 +252,6 @@ func (d *Local) run(ctx context.Context, selfOpenID string, runEventSource bool)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := d.flushLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
-			errCh <- err
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
 		if err := d.tickLoop(runCtx); err != nil && !errors.Is(err, context.Canceled) && runCtx.Err() == nil {
 			errCh <- err
 		}
@@ -343,20 +326,19 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 		Cols:      req.Cols,
 		Heartbeat: d.sessions.HeartbeatConfig(),
 	}
-	frame, err := protocol.NewJSONFrame(1, protocol.TypeStart, startPayload)
-	if err != nil {
-		return "", err
-	}
-	text, err := protocol.EncodeFrames([]protocol.Frame{frame})
-	if err != nil {
-		return "", err
-	}
-
-	root, err := d.client.SendRootMessage(ctx, host.ChatID, host.PeerBotOpenID, text)
+	root, err := d.outbound.OpenRoot(ctx, outbound.OpenRootRequest{
+		ChatID:            host.ChatID,
+		MentionOpenID:     host.PeerBotOpenID,
+		Role:              outbound.RoleLocal,
+		RequestID:         req.RequestID,
+		InitialType:       protocol.TypeStart,
+		InitialPayload:    startPayload,
+		HeartbeatInterval: d.cfg.Connection.HeartbeatInterval.Duration(),
+	})
 	if err != nil {
 		return "", fmt.Errorf("send start root message: %w", err)
 	}
-	connID := strings.TrimSpace(root.MessageID)
+	connID := strings.TrimSpace(root.RootMessageID)
 	if connID == "" {
 		return "", errors.New("lark root message response missing message_id")
 	}
@@ -417,74 +399,6 @@ func (d *Local) eventMatchesConfiguredHost(event lark.MessageEvent) bool {
 		}
 	}
 	return false
-}
-
-func (d *Local) flushLoop(ctx context.Context) error {
-	timer := time.NewTimer(d.flushInterval)
-	defer timer.Stop()
-	failures := newFlushFailureTracker()
-	retryWait := time.Duration(0)
-
-	for {
-		target, hasTarget := d.queue.FrontTarget()
-		flushed, err := d.queue.FlushReady(ctx)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if hasTarget && failures.record(target) >= outboundFlushMaxFailures {
-				d.dropFailedLocalTarget(err, failures)
-				retryWait = 0
-				continue
-			}
-			retryWait = nextOutboundFlushRetryWait(retryWait)
-			d.logger.Warn("local outbound flush failed; retrying", "error", err, "retry_in", retryWait)
-			if err := waitFlushRetry(ctx, timer, retryWait); err != nil {
-				return err
-			}
-			continue
-		}
-		if flushed {
-			if hasTarget {
-				failures.reset(target)
-			}
-			retryWait = 0
-			continue
-		}
-
-		wait := d.flushInterval
-		if next, ok := d.queue.NextFlushAt(); ok {
-			wait = time.Until(next)
-			if wait < 0 {
-				wait = 0
-			}
-		}
-		if wait <= 0 {
-			wait = d.flushInterval
-		}
-		if err := waitFlushRetry(ctx, timer, wait); err != nil {
-			return err
-		}
-	}
-}
-
-func (d *Local) dropFailedLocalTarget(cause error, failures *flushFailureTracker) {
-	dropped, frameCount, ok := d.queue.DropFrontTarget()
-	if !ok {
-		return
-	}
-	failures.reset(dropped)
-	if strings.TrimSpace(dropped.RootMessageID) != "" {
-		d.sessions.CloseLocalConn(dropped.RootMessageID)
-	}
-	d.logger.Warn(
-		"local outbound flush failed too many times; dropped connection",
-		"chat_id", dropped.ChatID,
-		"root_message_id", dropped.RootMessageID,
-		"mention_open_id", dropped.MentionOpenID,
-		"frames", frameCount,
-		"error", cause,
-	)
 }
 
 func (d *Local) tickLoop(ctx context.Context) error {
