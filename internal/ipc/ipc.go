@@ -36,11 +36,13 @@ const (
 	TypeResize       MessageType = "resize"
 	TypeSignal       MessageType = "signal"
 	TypeClose        MessageType = "close"
+	TypeStatus       MessageType = "status"
 
-	TypeStdout MessageType = "stdout"
-	TypeStderr MessageType = "stderr"
-	TypeExit   MessageType = "exit"
-	TypeError  MessageType = "error"
+	TypeStdout       MessageType = "stdout"
+	TypeStderr       MessageType = "stderr"
+	TypeExit         MessageType = "exit"
+	TypeStatusResult MessageType = "status_result"
+	TypeError        MessageType = "error"
 )
 
 const (
@@ -55,58 +57,78 @@ const (
 // Message is one IPC message. Bytes is transported outside the JSON header as
 // an optional raw byte payload.
 type Message struct {
-	Type      MessageType       `json:"type"`
-	RequestID string            `json:"request_id,omitempty"`
-	Host      string            `json:"host,omitempty"`
-	Cmd       string            `json:"cmd,omitempty"`
-	Pty       bool              `json:"pty,omitempty"`
-	Cwd       string            `json:"cwd,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	Shell     string            `json:"shell,omitempty"`
-	Rows      int               `json:"rows,omitempty"`
-	Cols      int               `json:"cols,omitempty"`
-	Name      string            `json:"name,omitempty"`
-	Reason    string            `json:"reason,omitempty"`
-	Code      int               `json:"code,omitempty"`
+	Type       MessageType       `json:"type"`
+	RequestID  string            `json:"request_id,omitempty"`
+	Host       string            `json:"host,omitempty"`
+	HostConfig *HostConfig       `json:"host_config,omitempty"`
+	ConfigPath string            `json:"config_path,omitempty"`
+	SocketPath string            `json:"socket_path,omitempty"`
+	NodeName   string            `json:"node_name,omitempty"`
+	Cmd        string            `json:"cmd,omitempty"`
+	Pty        bool              `json:"pty,omitempty"`
+	Cwd        string            `json:"cwd,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+	Shell      string            `json:"shell,omitempty"`
+	Rows       int               `json:"rows,omitempty"`
+	Cols       int               `json:"cols,omitempty"`
+	Name       string            `json:"name,omitempty"`
+	Reason     string            `json:"reason,omitempty"`
+	Code       int               `json:"code,omitempty"`
 
 	ErrorCode string `json:"error_code,omitempty"`
 	Message   string `json:"message,omitempty"`
 	Detail    string `json:"detail,omitempty"`
 
+	DaemonStatus *DaemonStatus `json:"daemon_status,omitempty"`
+
 	Bytes []byte `json:"-"`
 }
 
 type messageHeader struct {
-	Type      MessageType       `json:"type"`
-	RequestID string            `json:"request_id,omitempty"`
-	Host      string            `json:"host,omitempty"`
-	Cmd       string            `json:"cmd,omitempty"`
-	Pty       bool              `json:"pty,omitempty"`
-	Cwd       string            `json:"cwd,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	Shell     string            `json:"shell,omitempty"`
-	Rows      int               `json:"rows,omitempty"`
-	Cols      int               `json:"cols,omitempty"`
-	Name      string            `json:"name,omitempty"`
-	Reason    string            `json:"reason,omitempty"`
-	Code      int               `json:"code,omitempty"`
-	ErrorCode string            `json:"error_code,omitempty"`
-	Message   string            `json:"message,omitempty"`
-	Detail    string            `json:"detail,omitempty"`
-	BytesLen  int               `json:"bytes_len,omitempty"`
+	Type         MessageType       `json:"type"`
+	RequestID    string            `json:"request_id,omitempty"`
+	Host         string            `json:"host,omitempty"`
+	HostConfig   *HostConfig       `json:"host_config,omitempty"`
+	ConfigPath   string            `json:"config_path,omitempty"`
+	SocketPath   string            `json:"socket_path,omitempty"`
+	NodeName     string            `json:"node_name,omitempty"`
+	Cmd          string            `json:"cmd,omitempty"`
+	Pty          bool              `json:"pty,omitempty"`
+	Cwd          string            `json:"cwd,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	Shell        string            `json:"shell,omitempty"`
+	Rows         int               `json:"rows,omitempty"`
+	Cols         int               `json:"cols,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Reason       string            `json:"reason,omitempty"`
+	Code         int               `json:"code,omitempty"`
+	ErrorCode    string            `json:"error_code,omitempty"`
+	Message      string            `json:"message,omitempty"`
+	Detail       string            `json:"detail,omitempty"`
+	DaemonStatus *DaemonStatus     `json:"daemon_status,omitempty"`
+	BytesLen     int               `json:"bytes_len,omitempty"`
+}
+
+type HostConfig struct {
+	ChatID           string `json:"chat_id,omitempty"`
+	PeerBotOpenID    string `json:"peer_bot_open_id,omitempty"`
+	Shell            string `json:"shell,omitempty"`
+	StreamChunkBytes int    `json:"stream_chunk_bytes,omitempty"`
+	DefaultCWD       string `json:"default_cwd,omitempty"`
 }
 
 // StartSessionRequest is sent by elark CLI to open one daemon-managed session.
 type StartSessionRequest struct {
-	RequestID string
-	Host      string
-	Cmd       string
-	Pty       bool
-	Cwd       string
-	Env       map[string]string
-	Shell     string
-	Rows      int
-	Cols      int
+	RequestID  string
+	Host       string
+	HostConfig HostConfig
+	Cmd        string
+	Pty        bool
+	Cwd        string
+	Env        map[string]string
+	Shell      string
+	Rows       int
+	Cols       int
 }
 
 type StdinRequest struct {
@@ -130,6 +152,47 @@ type CloseRequest struct {
 	Reason    string
 }
 
+type StatusRequest struct {
+	RequestID  string
+	ConfigPath string
+	SocketPath string
+	Host       string
+	NodeName   string
+}
+
+type DaemonStatus struct {
+	Running       bool   `json:"running"`
+	SocketPath    string `json:"socket_path,omitempty"`
+	SelfBotOpenID string `json:"self_bot_open_id,omitempty"`
+
+	Event    EventConnectionStatus `json:"event,omitempty"`
+	Outbound OutboundQueueStatus   `json:"outbound,omitempty"`
+}
+
+type EventConnectionStatus struct {
+	Checked         bool      `json:"checked"`
+	Connected       bool      `json:"connected"`
+	LastConnectedAt time.Time `json:"last_connected_at,omitempty"`
+	LastEventAt     time.Time `json:"last_event_at,omitempty"`
+	Error           string    `json:"error,omitempty"`
+}
+
+type OutboundQueueStatus struct {
+	Checked        bool             `json:"checked"`
+	PendingFrames  int              `json:"pending_frames"`
+	PendingTargets []OutboundTarget `json:"pending_targets,omitempty"`
+	LastSentAt     time.Time        `json:"last_sent_at,omitempty"`
+	HasLastSent    bool             `json:"has_last_sent"`
+	NextFlushAt    time.Time        `json:"next_flush_at,omitempty"`
+	HasNextFlush   bool             `json:"has_next_flush"`
+}
+
+type OutboundTarget struct {
+	ChatID        string `json:"chat_id,omitempty"`
+	RootMessageID string `json:"root_message_id,omitempty"`
+	MentionOpenID string `json:"mention_open_id,omitempty"`
+}
+
 // Handler is implemented by local elarkd. Handler methods should register or
 // update daemon state quickly and return; output can be written through Session.
 type Handler interface {
@@ -138,6 +201,7 @@ type Handler interface {
 	Resize(context.Context, ResizeRequest) error
 	Signal(context.Context, SignalRequest) error
 	Close(context.Context, CloseRequest) error
+	Status(context.Context, StatusRequest) (DaemonStatus, error)
 }
 
 // HandlerFuncs lets tests and small integrations implement Handler without a
@@ -148,6 +212,7 @@ type HandlerFuncs struct {
 	ResizeFunc       func(context.Context, ResizeRequest) error
 	SignalFunc       func(context.Context, SignalRequest) error
 	CloseFunc        func(context.Context, CloseRequest) error
+	StatusFunc       func(context.Context, StatusRequest) (DaemonStatus, error)
 }
 
 func (h HandlerFuncs) StartSession(ctx context.Context, sess *Session, req StartSessionRequest) error {
@@ -183,6 +248,13 @@ func (h HandlerFuncs) Close(ctx context.Context, req CloseRequest) error {
 		return nil
 	}
 	return h.CloseFunc(ctx, req)
+}
+
+func (h HandlerFuncs) Status(ctx context.Context, req StatusRequest) (DaemonStatus, error) {
+	if h.StatusFunc == nil {
+		return DaemonStatus{Running: true}, nil
+	}
+	return h.StatusFunc(ctx, req)
 }
 
 // RPCError is the stable error envelope used on the wire for TypeError.
@@ -256,17 +328,33 @@ func (m Message) AsError() *RPCError {
 
 func StartSessionMessage(req StartSessionRequest) Message {
 	return Message{
-		Type:      TypeStartSession,
-		RequestID: req.RequestID,
-		Host:      req.Host,
-		Cmd:       req.Cmd,
-		Pty:       req.Pty,
-		Cwd:       req.Cwd,
-		Env:       cloneEnv(req.Env),
-		Shell:     req.Shell,
-		Rows:      req.Rows,
-		Cols:      req.Cols,
+		Type:       TypeStartSession,
+		RequestID:  req.RequestID,
+		Host:       req.Host,
+		HostConfig: cloneHostConfig(req.HostConfig),
+		Cmd:        req.Cmd,
+		Pty:        req.Pty,
+		Cwd:        req.Cwd,
+		Env:        cloneEnv(req.Env),
+		Shell:      req.Shell,
+		Rows:       req.Rows,
+		Cols:       req.Cols,
 	}
+}
+
+func StatusMessage(req StatusRequest) Message {
+	return Message{
+		Type:       TypeStatus,
+		RequestID:  req.RequestID,
+		ConfigPath: req.ConfigPath,
+		SocketPath: req.SocketPath,
+		Host:       req.Host,
+		NodeName:   req.NodeName,
+	}
+}
+
+func StatusResultMessage(requestID string, status DaemonStatus) Message {
+	return Message{Type: TypeStatusResult, RequestID: requestID, DaemonStatus: cloneDaemonStatus(status)}
 }
 
 func StdinMessage(requestID string, data []byte) Message {
@@ -484,6 +572,35 @@ func (c *Client) Receive(ctx context.Context) (Message, error) {
 	return c.conn.Read(ctx)
 }
 
+func (c *Client) Status(ctx context.Context, req StatusRequest) (DaemonStatus, error) {
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = fmt.Sprintf("status-%d", time.Now().UnixNano())
+	}
+	if err := c.conn.Write(ctx, StatusMessage(req)); err != nil {
+		return DaemonStatus{}, err
+	}
+	for {
+		msg, err := c.Receive(ctx)
+		if err != nil {
+			return DaemonStatus{}, err
+		}
+		if msg.RequestID != "" && msg.RequestID != req.RequestID {
+			continue
+		}
+		switch msg.Type {
+		case TypeStatusResult:
+			if msg.DaemonStatus == nil {
+				return DaemonStatus{}, fmt.Errorf("%w: status_result missing daemon_status", ErrInvalidMessage)
+			}
+			return cloneDaemonStatusValue(msg.DaemonStatus), nil
+		case TypeError:
+			return DaemonStatus{}, msg.AsError()
+		default:
+			return DaemonStatus{}, fmt.Errorf("%w: unexpected status response type %q", ErrInvalidMessage, msg.Type)
+		}
+	}
+}
+
 // Server listens on one local Unix socket and serves every CLI connection in a
 // separate goroutine.
 type Server struct {
@@ -633,15 +750,16 @@ func (s *Server) dispatch(ctx context.Context, session *Session, msg Message) er
 	switch msg.Type {
 	case TypeStartSession:
 		return s.handler.StartSession(ctx, session, StartSessionRequest{
-			RequestID: msg.RequestID,
-			Host:      msg.Host,
-			Cmd:       msg.Cmd,
-			Pty:       msg.Pty,
-			Cwd:       msg.Cwd,
-			Env:       cloneEnv(msg.Env),
-			Shell:     msg.Shell,
-			Rows:      msg.Rows,
-			Cols:      msg.Cols,
+			RequestID:  msg.RequestID,
+			Host:       msg.Host,
+			HostConfig: cloneHostConfigValue(msg.HostConfig),
+			Cmd:        msg.Cmd,
+			Pty:        msg.Pty,
+			Cwd:        msg.Cwd,
+			Env:        cloneEnv(msg.Env),
+			Shell:      msg.Shell,
+			Rows:       msg.Rows,
+			Cols:       msg.Cols,
 		})
 	case TypeStdin:
 		return s.handler.Stdin(ctx, StdinRequest{RequestID: msg.RequestID, Bytes: append([]byte(nil), msg.Bytes...)})
@@ -651,6 +769,18 @@ func (s *Server) dispatch(ctx context.Context, session *Session, msg Message) er
 		return s.handler.Signal(ctx, SignalRequest{RequestID: msg.RequestID, Name: msg.Name})
 	case TypeClose:
 		return s.handler.Close(ctx, CloseRequest{RequestID: msg.RequestID, Reason: msg.Reason})
+	case TypeStatus:
+		status, err := s.handler.Status(ctx, StatusRequest{
+			RequestID:  msg.RequestID,
+			ConfigPath: msg.ConfigPath,
+			SocketPath: msg.SocketPath,
+			Host:       msg.Host,
+			NodeName:   msg.NodeName,
+		})
+		if err != nil {
+			return err
+		}
+		return session.conn.Write(ctx, StatusResultMessage(msg.RequestID, status))
 	default:
 		return NewRPCError(ErrorCodeBadRequest, "unsupported client message type", string(msg.Type))
 	}
@@ -675,43 +805,53 @@ func errorMessageFromError(requestID string, err error) Message {
 
 func (m Message) toHeader() messageHeader {
 	return messageHeader{
-		Type:      m.Type,
-		RequestID: m.RequestID,
-		Host:      m.Host,
-		Cmd:       m.Cmd,
-		Pty:       m.Pty,
-		Cwd:       m.Cwd,
-		Env:       cloneEnv(m.Env),
-		Shell:     m.Shell,
-		Rows:      m.Rows,
-		Cols:      m.Cols,
-		Name:      m.Name,
-		Reason:    m.Reason,
-		Code:      m.Code,
-		ErrorCode: m.ErrorCode,
-		Message:   m.Message,
-		Detail:    m.Detail,
+		Type:         m.Type,
+		RequestID:    m.RequestID,
+		Host:         m.Host,
+		HostConfig:   cloneHostConfigPtr(m.HostConfig),
+		ConfigPath:   m.ConfigPath,
+		SocketPath:   m.SocketPath,
+		NodeName:     m.NodeName,
+		Cmd:          m.Cmd,
+		Pty:          m.Pty,
+		Cwd:          m.Cwd,
+		Env:          cloneEnv(m.Env),
+		Shell:        m.Shell,
+		Rows:         m.Rows,
+		Cols:         m.Cols,
+		Name:         m.Name,
+		Reason:       m.Reason,
+		Code:         m.Code,
+		ErrorCode:    m.ErrorCode,
+		Message:      m.Message,
+		Detail:       m.Detail,
+		DaemonStatus: cloneDaemonStatusPtr(m.DaemonStatus),
 	}
 }
 
 func messageFromHeader(h messageHeader) Message {
 	return Message{
-		Type:      h.Type,
-		RequestID: h.RequestID,
-		Host:      h.Host,
-		Cmd:       h.Cmd,
-		Pty:       h.Pty,
-		Cwd:       h.Cwd,
-		Env:       cloneEnv(h.Env),
-		Shell:     h.Shell,
-		Rows:      h.Rows,
-		Cols:      h.Cols,
-		Name:      h.Name,
-		Reason:    h.Reason,
-		Code:      h.Code,
-		ErrorCode: h.ErrorCode,
-		Message:   h.Message,
-		Detail:    h.Detail,
+		Type:         h.Type,
+		RequestID:    h.RequestID,
+		Host:         h.Host,
+		HostConfig:   cloneHostConfigPtr(h.HostConfig),
+		ConfigPath:   h.ConfigPath,
+		SocketPath:   h.SocketPath,
+		NodeName:     h.NodeName,
+		Cmd:          h.Cmd,
+		Pty:          h.Pty,
+		Cwd:          h.Cwd,
+		Env:          cloneEnv(h.Env),
+		Shell:        h.Shell,
+		Rows:         h.Rows,
+		Cols:         h.Cols,
+		Name:         h.Name,
+		Reason:       h.Reason,
+		Code:         h.Code,
+		ErrorCode:    h.ErrorCode,
+		Message:      h.Message,
+		Detail:       h.Detail,
+		DaemonStatus: cloneDaemonStatusPtr(h.DaemonStatus),
 	}
 }
 
@@ -752,9 +892,20 @@ func (m Message) validate(maxPayloadBytes int) error {
 		if strings.TrimSpace(m.RequestID) == "" {
 			return fmt.Errorf("%w: close request_id is required", ErrInvalidMessage)
 		}
+	case TypeStatus:
+		if strings.TrimSpace(m.RequestID) == "" {
+			return fmt.Errorf("%w: status request_id is required", ErrInvalidMessage)
+		}
 	case TypeExit:
 		if strings.TrimSpace(m.RequestID) == "" {
 			return fmt.Errorf("%w: exit request_id is required", ErrInvalidMessage)
+		}
+	case TypeStatusResult:
+		if strings.TrimSpace(m.RequestID) == "" {
+			return fmt.Errorf("%w: status_result request_id is required", ErrInvalidMessage)
+		}
+		if m.DaemonStatus == nil {
+			return fmt.Errorf("%w: status_result daemon_status is required", ErrInvalidMessage)
 		}
 	case TypeError:
 		if strings.TrimSpace(m.ErrorCode) == "" {
@@ -869,6 +1020,53 @@ func cloneEnv(env map[string]string) map[string]string {
 	out := make(map[string]string, len(env))
 	for key, value := range env {
 		out[key] = value
+	}
+	return out
+}
+
+func cloneHostConfig(in HostConfig) *HostConfig {
+	if in == (HostConfig{}) {
+		return nil
+	}
+	out := in
+	return &out
+}
+
+func cloneHostConfigPtr(in *HostConfig) *HostConfig {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneHostConfigValue(in *HostConfig) HostConfig {
+	if in == nil {
+		return HostConfig{}
+	}
+	return *in
+}
+
+func cloneDaemonStatus(in DaemonStatus) *DaemonStatus {
+	out := cloneDaemonStatusValue(&in)
+	return &out
+}
+
+func cloneDaemonStatusPtr(in *DaemonStatus) *DaemonStatus {
+	if in == nil {
+		return nil
+	}
+	out := cloneDaemonStatusValue(in)
+	return &out
+}
+
+func cloneDaemonStatusValue(in *DaemonStatus) DaemonStatus {
+	if in == nil {
+		return DaemonStatus{}
+	}
+	out := *in
+	if in.Outbound.PendingTargets != nil {
+		out.Outbound.PendingTargets = append([]OutboundTarget(nil), in.Outbound.PendingTargets...)
 	}
 	return out
 }

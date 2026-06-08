@@ -4,6 +4,8 @@ set -eu
 REPO="${ELARK_REPO:-hachiwii/exec-over-lark}"
 RELEASE_API_URL="${ELARK_RELEASE_API_URL:-https://api.github.com/repos/${REPO}/releases/latest}"
 INSTALL_DIR="${ELARK_INSTALL_DIR:-}"
+SYSTEM_INSTALL=0
+AUTO_INSTALL=1
 
 log() {
 	printf '%s\n' "$*"
@@ -21,6 +23,37 @@ die() {
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
+
+usage() {
+	cat <<'EOF'
+Usage:
+  install.sh [--system] [--no-install]
+
+Options:
+  --system      install elarkd as a system daemon
+  --no-install  install binaries only; do not run elarkd install
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--system)
+			SYSTEM_INSTALL=1
+			shift
+			;;
+		--no-install)
+			AUTO_INSTALL=0
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown option: $1"
+			;;
+	esac
+done
 
 download_to() {
 	url=$1
@@ -194,6 +227,21 @@ install_binary() {
 	[ -x "$destination" ] || die "installed ${destination} is not executable"
 }
 
+run_daemon_install() {
+	elarkd_bin="${install_dir}/elarkd"
+	[ -x "$elarkd_bin" ] || die "installed ${elarkd_bin} is not executable"
+	if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+		if [ "$(id -u)" -eq 0 ]; then
+			"$elarkd_bin" install --system || die "elarkd system install failed"
+		else
+			command_exists sudo || die "--system requires sudo"
+			sudo "$elarkd_bin" install --system || die "elarkd system install failed"
+		fi
+		return
+	fi
+	"$elarkd_bin" install || die "elarkd install failed"
+}
+
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/elark-install.XXXXXX") || die "failed to create temporary directory"
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
@@ -240,6 +288,10 @@ elarkd_source=$(find_extracted_binary "$extract_dir" elarkd)
 install_binary "$elark_source" elark
 install_binary "$elarkd_source" elarkd
 
+if [ "$AUTO_INSTALL" -eq 1 ]; then
+	run_daemon_install
+fi
+
 log ""
 log "exec-over-lark installed successfully."
 log ""
@@ -250,8 +302,28 @@ log "Generate initial configuration:"
 log "  ${install_dir}/elarkd init --client"
 log "  ${install_dir}/elarkd init --server"
 log ""
+if [ "$AUTO_INSTALL" -eq 1 ]; then
+	log "Daemon service:"
+	if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+		log "  installed with: sudo ${install_dir}/elarkd install --system"
+	else
+		log "  installed with: ${install_dir}/elarkd install"
+	fi
+else
+	log "Daemon service:"
+	if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+		log "  sudo ${install_dir}/elarkd install --system"
+	else
+		log "  ${install_dir}/elarkd install"
+	fi
+fi
+log ""
 log "Start background process:"
-log "  ${install_dir}/elark daemon start"
+if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+	log "  sudo ${install_dir}/elarkd start --system"
+else
+	log "  ${install_dir}/elarkd start"
+fi
 
 if ! path_contains_dir "$install_dir"; then
 	log ""

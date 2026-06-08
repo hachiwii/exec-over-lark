@@ -13,7 +13,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/outbound"
 )
 
-func TestRunAllChecksPassWithFakeDaemonAndLark(t *testing.T) {
+func TestRunAllChecksPassWithFakeDaemon(t *testing.T) {
 	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
 	secret := "super-secret-value"
 	path := writeDoctorConfig(t, secret)
@@ -34,15 +34,10 @@ func TestRunAllChecksPassWithFakeDaemonAndLark(t *testing.T) {
 			},
 		},
 	}
-	larkClient := &fakeLark{
-		token: "tenant-token-secret",
-	}
 
 	report := Run(context.Background(), Options{
 		ConfigPath: path,
-		Host:       "macmini",
 		Daemon:     daemon,
-		Lark:       larkClient,
 		Now:        func() time.Time { return now },
 	})
 
@@ -52,32 +47,26 @@ func TestRunAllChecksPassWithFakeDaemonAndLark(t *testing.T) {
 	for _, id := range []CheckID{
 		CheckConfigPermissions,
 		CheckConfigLoad,
-		CheckHostConfig,
 		CheckDaemonStatus,
 		CheckDaemonSocket,
-		CheckTokenRefresh,
 		CheckEventConnection,
 		CheckOutboundQueue,
 	} {
 		assertCheckStatus(t, report, id, StatusOK)
 	}
-	assertCheckStatus(t, report, CheckBotOpenID, StatusSkipped)
-	assertCheckStatus(t, report, CheckChat, StatusSkipped)
-	assertCheckStatus(t, report, CheckPeerBot, StatusSkipped)
-	assertCheckStatus(t, report, CheckBootstrap, StatusSkipped)
+	assertCheckMissing(t, report, "host_config")
+	assertCheckMissing(t, report, "token_refresh")
+	assertCheckMissing(t, report, "bot_open_id")
+	assertCheckMissing(t, report, "chat")
+	assertCheckMissing(t, report, "peer_bot")
+	assertCheckMissing(t, report, "bootstrap")
 	assertCheckMissing(t, report, "ping_root_message")
 	if got := len(daemon.requests); got != 1 {
 		t.Fatalf("daemon requests = %d, want 1", got)
 	}
-	if daemon.requests[0].Host != "macmini" {
-		t.Fatalf("daemon host = %q, want macmini", daemon.requests[0].Host)
-	}
-	if larkClient.tokenCalls != 1 {
-		t.Fatalf("token calls = %d, want 1", larkClient.tokenCalls)
-	}
 
 	text := report.Text()
-	for _, forbidden := range []string{secret, "tenant-token-secret"} {
+	for _, forbidden := range []string{secret} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("report leaked secret %q:\n%s", forbidden, text)
 		}
@@ -109,15 +98,9 @@ func TestRunReportsFailuresWarningsAndRedactsSecrets(t *testing.T) {
 			},
 		},
 	}
-	larkClient := &fakeLark{
-		tokenErr: fmt.Errorf("auth failed app_secret=%s bearer raw-access-token", secret),
-	}
-
 	report := Run(context.Background(), Options{
 		ConfigPath: path,
-		Host:       "macmini",
 		Daemon:     daemon,
-		Lark:       larkClient,
 		Now:        func() time.Time { return now },
 	})
 
@@ -126,13 +109,13 @@ func TestRunReportsFailuresWarningsAndRedactsSecrets(t *testing.T) {
 	}
 	assertCheckStatus(t, report, CheckDaemonStatus, StatusFailed)
 	assertCheckStatus(t, report, CheckDaemonSocket, StatusFailed)
-	assertCheckStatus(t, report, CheckTokenRefresh, StatusFailed)
 	assertCheckStatus(t, report, CheckEventConnection, StatusFailed)
-	assertCheckStatus(t, report, CheckBotOpenID, StatusSkipped)
-	assertCheckStatus(t, report, CheckChat, StatusSkipped)
-	assertCheckStatus(t, report, CheckPeerBot, StatusSkipped)
-	assertCheckStatus(t, report, CheckBootstrap, StatusSkipped)
 	assertCheckStatus(t, report, CheckOutboundQueue, StatusWarning)
+	assertCheckMissing(t, report, "token_refresh")
+	assertCheckMissing(t, report, "bot_open_id")
+	assertCheckMissing(t, report, "chat")
+	assertCheckMissing(t, report, "peer_bot")
+	assertCheckMissing(t, report, "bootstrap")
 	assertCheckMissing(t, report, "ping_root_message")
 
 	text := report.Text()
@@ -140,9 +123,6 @@ func TestRunReportsFailuresWarningsAndRedactsSecrets(t *testing.T) {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("report leaked secret %q:\n%s", forbidden, text)
 		}
-	}
-	if !strings.Contains(text, "[redacted]") {
-		t.Fatalf("report did not show redaction marker:\n%s", text)
 	}
 }
 
@@ -158,17 +138,25 @@ func TestRunRejectsInsecureConfigPermissions(t *testing.T) {
 	}
 	assertCheckStatus(t, report, CheckConfigPath, StatusOK)
 	assertCheckStatus(t, report, CheckConfigPermissions, StatusFailed)
-	if _, ok := report.Check(CheckTokenRefresh); ok {
+	if _, ok := report.Check("token_refresh"); ok {
 		t.Fatalf("token refresh ran after insecure config:\n%s", report.Text())
 	}
 }
 
 func TestRunAcceptsInMemoryFakeConfig(t *testing.T) {
+	socketDir := t.TempDir()
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	cfg := &config.Config{
 		NodeName: "server",
 		Lark: config.LarkConfig{
 			AppID:     "cli_server_xxx",
 			AppSecret: "fake-secret-value",
+		},
+		IPC: config.IPCConfig{
+			Enabled:    true,
+			SocketPath: filepath.Join(socketDir, "elarkd.sock"),
 		},
 		Exec: config.ExecConfig{
 			Enabled:      true,
@@ -178,6 +166,13 @@ func TestRunAcceptsInMemoryFakeConfig(t *testing.T) {
 
 	report := Run(context.Background(), Options{
 		Config: cfg,
+		Daemon: &fakeDaemon{status: DaemonStatus{
+			Running: true,
+			Event:   EventConnectionStatus{Checked: true, Connected: true},
+			Outbound: OutboundQueueStatus{
+				Checked: true,
+			},
+		}},
 	})
 
 	if report.Failed() {
@@ -186,7 +181,7 @@ func TestRunAcceptsInMemoryFakeConfig(t *testing.T) {
 	assertCheckStatus(t, report, CheckConfigPath, StatusSkipped)
 	assertCheckStatus(t, report, CheckConfigPermissions, StatusSkipped)
 	assertCheckStatus(t, report, CheckConfigLoad, StatusOK)
-	assertCheckStatus(t, report, CheckHostConfig, StatusSkipped)
+	assertCheckMissing(t, report, "host_config")
 }
 
 func writeDoctorConfig(t *testing.T, secret string) string {
@@ -255,18 +250,4 @@ func (f *fakeDaemon) Status(_ context.Context, req DaemonStatusRequest) (DaemonS
 		return DaemonStatus{}, f.err
 	}
 	return f.status, nil
-}
-
-type fakeLark struct {
-	token      string
-	tokenErr   error
-	tokenCalls int
-}
-
-func (f *fakeLark) TenantAccessToken(context.Context) (string, error) {
-	f.tokenCalls++
-	if f.tokenErr != nil {
-		return "", f.tokenErr
-	}
-	return f.token, nil
 }

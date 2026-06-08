@@ -49,6 +49,8 @@ mockbin="${tmpdir}/mockbin"
 release_dir="${tmpdir}/release"
 payload_root="${tmpdir}/payload"
 install_dir="${tmpdir}/install"
+install_dir_no_install="${tmpdir}/install-no-install"
+install_dir_system="${tmpdir}/install-system"
 mkdir -p "$mockbin" "$release_dir" "$payload_root"
 
 cat >"${mockbin}/curl" <<'EOF'
@@ -89,6 +91,14 @@ esac
 EOF
 chmod 0755 "${mockbin}/curl"
 
+cat >"${mockbin}/sudo" <<'EOF'
+#!/bin/sh
+set -eu
+echo "sudo $*" >>"${ELARK_INSTALL_TEST_CALLS:?}"
+exec "$@"
+EOF
+chmod 0755 "${mockbin}/sudo"
+
 asset_dir="${payload_root}/exec-over-lark_v9.9.9_${goos}_${goarch}"
 mkdir -p "$asset_dir"
 
@@ -99,6 +109,7 @@ EOF
 
 cat >"${asset_dir}/elarkd" <<'EOF'
 #!/bin/sh
+echo "elarkd $*" >>"${ELARK_INSTALL_TEST_CALLS:?}"
 echo "fake elarkd $*"
 EOF
 
@@ -137,6 +148,7 @@ output=$(
 	PATH="${mockbin}:${PATH}" \
 	ELARK_RELEASE_API_URL="file://${release_json}" \
 	ELARK_INSTALL_DIR="$install_dir" \
+	ELARK_INSTALL_TEST_CALLS="${tmpdir}/calls-default" \
 	sh "${repo_root}/scripts/install.sh"
 )
 
@@ -154,5 +166,40 @@ assert_contains "$output" "$install_dir"
 assert_contains "$output" "Generate initial configuration:"
 assert_contains "$output" "${install_dir}/elarkd init --client"
 assert_contains "$output" "${install_dir}/elarkd init --server"
+assert_contains "$output" "Daemon service:"
+assert_contains "$output" "${install_dir}/elarkd install"
 assert_contains "$output" "Start background process:"
-assert_contains "$output" "${install_dir}/elark daemon start"
+assert_contains "$output" "${install_dir}/elarkd start"
+assert_contains "$(cat "${tmpdir}/calls-default")" "elarkd install"
+
+output_no_install=$(
+	PATH="${mockbin}:${PATH}" \
+	ELARK_RELEASE_API_URL="file://${release_json}" \
+	ELARK_INSTALL_DIR="$install_dir_no_install" \
+	ELARK_INSTALL_TEST_CALLS="${tmpdir}/calls-no-install" \
+	sh "${repo_root}/scripts/install.sh" --no-install
+)
+
+[ -x "${install_dir_no_install}/elarkd" ] || {
+	echo "elarkd was not installed for --no-install run" >&2
+	exit 1
+}
+if [ -e "${tmpdir}/calls-no-install" ] && grep -F "elarkd install" "${tmpdir}/calls-no-install" >/dev/null; then
+	echo "--no-install still called elarkd install" >&2
+	exit 1
+fi
+assert_contains "$output_no_install" "${install_dir_no_install}/elarkd install"
+assert_contains "$output_no_install" "${install_dir_no_install}/elarkd start"
+
+output_system=$(
+	PATH="${mockbin}:${PATH}" \
+	ELARK_RELEASE_API_URL="file://${release_json}" \
+	ELARK_INSTALL_DIR="$install_dir_system" \
+	ELARK_INSTALL_TEST_CALLS="${tmpdir}/calls-system" \
+	sh "${repo_root}/scripts/install.sh" --system
+)
+
+assert_contains "$output_system" "sudo ${install_dir_system}/elarkd install --system"
+assert_contains "$output_system" "sudo ${install_dir_system}/elarkd start --system"
+assert_contains "$(cat "${tmpdir}/calls-system")" "sudo ${install_dir_system}/elarkd install --system"
+assert_contains "$(cat "${tmpdir}/calls-system")" "elarkd install --system"

@@ -32,13 +32,20 @@ func TestStartSessionStreamsOutputOverUnixSocket(t *testing.T) {
 	req := StartSessionRequest{
 		RequestID: "req-1",
 		Host:      "macmini",
-		Cmd:       "printf hello",
-		Pty:       true,
-		Cwd:       "/tmp",
-		Env:       map[string]string{"A": "B"},
-		Shell:     "/bin/zsh",
-		Rows:      24,
-		Cols:      80,
+		HostConfig: HostConfig{
+			ChatID:           "oc_chat",
+			PeerBotOpenID:    "ou_peer_bot",
+			Shell:            "/bin/bash",
+			StreamChunkBytes: 4096,
+			DefaultCWD:       "/srv/app",
+		},
+		Cmd:   "printf hello",
+		Pty:   true,
+		Cwd:   "/tmp",
+		Env:   map[string]string{"A": "B"},
+		Shell: "/bin/zsh",
+		Rows:  24,
+		Cols:  80,
 	}
 	if err := client.StartSession(testContext(t), req); err != nil {
 		t.Fatalf("StartSession returned error: %v", err)
@@ -47,13 +54,64 @@ func TestStartSessionStreamsOutputOverUnixSocket(t *testing.T) {
 	gotStart := receiveValue(t, started)
 	if gotStart.RequestID != req.RequestID || gotStart.Host != req.Host || gotStart.Cmd != req.Cmd ||
 		!gotStart.Pty || gotStart.Cwd != req.Cwd || gotStart.Shell != req.Shell ||
-		gotStart.Rows != req.Rows || gotStart.Cols != req.Cols || gotStart.Env["A"] != "B" {
+		gotStart.Rows != req.Rows || gotStart.Cols != req.Cols || gotStart.Env["A"] != "B" ||
+		gotStart.HostConfig.ChatID != "oc_chat" || gotStart.HostConfig.PeerBotOpenID != "ou_peer_bot" ||
+		gotStart.HostConfig.Shell != "/bin/bash" || gotStart.HostConfig.DefaultCWD != "/srv/app" ||
+		gotStart.HostConfig.StreamChunkBytes != 4096 {
 		t.Fatalf("start request mismatch: %#v", gotStart)
 	}
 
 	assertMessage(t, receiveMessage(t, client), TypeStdout, "req-1", "hello\n", 0)
 	assertMessage(t, receiveMessage(t, client), TypeStderr, "req-1", "warn\n", 0)
 	assertMessage(t, receiveMessage(t, client), TypeExit, "req-1", "", 7)
+}
+
+func TestStatusRoundTripOverUnixSocket(t *testing.T) {
+	requests := make(chan StatusRequest, 1)
+	server := startTestServer(t, HandlerFuncs{
+		StatusFunc: func(ctx context.Context, req StatusRequest) (DaemonStatus, error) {
+			requests <- req
+			return DaemonStatus{
+				Running:       true,
+				SocketPath:    req.SocketPath,
+				SelfBotOpenID: "ou_self_bot",
+				Event: EventConnectionStatus{
+					Checked:   true,
+					Connected: true,
+				},
+				Outbound: OutboundQueueStatus{
+					Checked:       true,
+					PendingFrames: 2,
+					PendingTargets: []OutboundTarget{{
+						ChatID:        "oc_chat",
+						RootMessageID: "om_root",
+						MentionOpenID: "ou_peer_bot",
+					}},
+				},
+			}, nil
+		},
+	})
+
+	client := dialTestClient(t, server.SocketPath())
+	defer client.Close()
+
+	status, err := client.Status(testContext(t), StatusRequest{
+		RequestID:  "status-1",
+		ConfigPath: "/tmp/config.toml",
+		SocketPath: server.SocketPath(),
+		NodeName:   "local",
+	})
+	if err != nil {
+		t.Fatalf("Status returned error: %v", err)
+	}
+	req := receiveValue(t, requests)
+	if req.RequestID != "status-1" || req.SocketPath != server.SocketPath() || req.NodeName != "local" {
+		t.Fatalf("status request mismatch: %#v", req)
+	}
+	if !status.Running || status.SelfBotOpenID != "ou_self_bot" || !status.Event.Connected ||
+		status.Outbound.PendingFrames != 2 || len(status.Outbound.PendingTargets) != 1 {
+		t.Fatalf("status response mismatch: %#v", status)
+	}
 }
 
 func TestInputControlsReachHandler(t *testing.T) {

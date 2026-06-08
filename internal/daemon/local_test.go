@@ -155,6 +155,43 @@ func TestStartLocalSessionCreatesRootMessageAndSendsControls(t *testing.T) {
 	}
 }
 
+func TestStartLocalSessionUsesHostConfigFromIPCRequest(t *testing.T) {
+	cfg := testLocalConfig(t)
+	fakeLark := &fakeLarkClient{botOpenID: "ou_self_bot", nextRootID: "om_root"}
+	local := newTestLocal(t, cfg, fakeLark)
+
+	_, err := local.StartLocalSession(context.Background(), ipc.StartSessionRequest{
+		RequestID: "req-override",
+		Host:      "macmini",
+		Cmd:       "pwd",
+		HostConfig: ipc.HostConfig{
+			ChatID:           "oc_override",
+			PeerBotOpenID:    "ou_override_bot",
+			Shell:            "/bin/bash",
+			StreamChunkBytes: 2048,
+			DefaultCWD:       "/override/cwd",
+		},
+	}, &fakeSubscriber{})
+	if err != nil {
+		t.Fatalf("StartLocalSession returned error: %v", err)
+	}
+	if len(fakeLark.roots) != 1 {
+		t.Fatalf("root messages = %d, want 1", len(fakeLark.roots))
+	}
+	root := fakeLark.roots[0]
+	if root.chatID != "oc_override" || root.mentionOpenID != "ou_override_bot" {
+		t.Fatalf("root target = %#v, want override target", root)
+	}
+	frames := decodeFrames(t, root.text)
+	start, err := protocol.DecodeJSONPayload[protocol.StartPayload](frames[0])
+	if err != nil {
+		t.Fatalf("DecodeJSONPayload returned error: %v", err)
+	}
+	if start.Cwd != "/override/cwd" || start.Shell != "/bin/bash" {
+		t.Fatalf("start payload = %#v, want override cwd/shell", start)
+	}
+}
+
 func TestHandleLarkEventDistributesRemoteFramesToSubscriber(t *testing.T) {
 	cfg := testLocalConfig(t)
 	fakeLark := &fakeLarkClient{botOpenID: "ou_self_bot", nextRootID: "om_root"}

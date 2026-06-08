@@ -34,15 +34,9 @@ const (
 	CheckConfigPath        CheckID = "config_path"
 	CheckConfigPermissions CheckID = "config_permissions"
 	CheckConfigLoad        CheckID = "config_load"
-	CheckHostConfig        CheckID = "host_config"
 	CheckDaemonSocket      CheckID = "daemon_socket"
 	CheckDaemonStatus      CheckID = "daemon_status"
-	CheckTokenRefresh      CheckID = "token_refresh"
-	CheckBotOpenID         CheckID = "bot_open_id"
 	CheckEventConnection   CheckID = "event_connection"
-	CheckChat              CheckID = "chat"
-	CheckPeerBot           CheckID = "peer_bot"
-	CheckBootstrap         CheckID = "bootstrap"
 	CheckOutboundQueue     CheckID = "outbound_queue"
 )
 
@@ -57,7 +51,6 @@ type Report struct {
 	GeneratedAt time.Time `json:"generated_at"`
 	ConfigPath  string    `json:"config_path,omitempty"`
 	NodeName    string    `json:"node_name,omitempty"`
-	Host        string    `json:"host,omitempty"`
 	Checks      []Check   `json:"checks"`
 }
 
@@ -82,9 +75,6 @@ func (r Report) Check(id CheckID) (Check, bool) {
 func (r Report) Text() string {
 	var lines []string
 	header := "exec-over-lark doctor"
-	if r.Host != "" {
-		header += " " + r.Host
-	}
 	lines = append(lines, header)
 	if r.ConfigPath != "" {
 		lines = append(lines, "config: "+r.ConfigPath)
@@ -109,11 +99,9 @@ func (r Report) String() string {
 type Options struct {
 	ConfigPath string
 	Config     *config.Config
-	Host       string
 
 	LoadConfig func(path string) (*config.Config, error)
 	Daemon     Daemon
-	Lark       LarkClient
 
 	Now         func() time.Time
 	DialTimeout time.Duration
@@ -126,7 +114,6 @@ type Daemon interface {
 type DaemonStatusRequest struct {
 	ConfigPath string
 	SocketPath string
-	Host       string
 	NodeName   string
 }
 
@@ -158,10 +145,6 @@ type OutboundQueueStatus struct {
 	HasLastSent    bool
 	NextFlushAt    time.Time
 	HasNextFlush   bool
-}
-
-type LarkClient interface {
-	TenantAccessToken(ctx context.Context) (string, error)
 }
 
 func OutboundStatusFromQueue(q *outbound.Queue) OutboundQueueStatus {
@@ -217,14 +200,8 @@ func (r *runner) run(ctx context.Context) {
 	r.cfg = cfg
 	r.report.NodeName = cfg.NodeName
 
-	hostName, host, hasHost := r.selectHost(cfg)
-	if hasHost {
-		r.report.Host = hostName
-	}
-
 	socketPath := r.socketPath(cfg)
 	daemonStatus, hasDaemonStatus := r.checkDaemon(ctx, socketPath)
-	r.checkLark(ctx, host, hasHost)
 	r.checkEventStatus(daemonStatus, hasDaemonStatus)
 	r.checkOutboundStatus(daemonStatus, hasDaemonStatus)
 }
@@ -292,35 +269,6 @@ func (r *runner) loadConfig() (*config.Config, bool) {
 	return cfg, true
 }
 
-func (r *runner) selectHost(cfg *config.Config) (string, config.HostConfig, bool) {
-	hostName := strings.TrimSpace(r.opts.Host)
-	if hostName == "" {
-		hostName = strings.TrimSpace(cfg.DefaultHost)
-	}
-	if hostName == "" && len(cfg.Hosts) == 1 {
-		for name := range cfg.Hosts {
-			hostName = name
-		}
-	}
-	if hostName == "" {
-		if len(cfg.Hosts) == 0 {
-			r.add(CheckHostConfig, StatusSkipped, "no host configured for this node", "")
-		} else {
-			r.add(CheckHostConfig, StatusSkipped, "no host selected", "pass a host name to run peer checks")
-		}
-		return "", config.HostConfig{}, false
-	}
-
-	host, ok := cfg.Hosts[hostName]
-	if !ok {
-		r.add(CheckHostConfig, StatusFailed, "host is not defined in config", hostName)
-		return hostName, config.HostConfig{}, false
-	}
-	detail := fmt.Sprintf("chat_id=%s peer_bot_open_id=%s", host.ChatID, host.PeerBotOpenID)
-	r.add(CheckHostConfig, StatusOK, "host config is present", detail)
-	return hostName, host, true
-}
-
 func (r *runner) socketPath(cfg *config.Config) string {
 	if cfg == nil || strings.TrimSpace(cfg.IPC.SocketPath) == "" {
 		return ""
@@ -340,14 +288,25 @@ func (r *runner) socketPath(cfg *config.Config) string {
 }
 
 func (r *runner) checkDaemon(ctx context.Context, socketPath string) (DaemonStatus, bool) {
+	if r.cfg == nil || !r.cfg.IPC.Enabled {
+		r.add(CheckDaemonSocket, StatusFailed, "ipc.enabled must be true for elark doctor", "")
+		r.add(CheckDaemonStatus, StatusFailed, "daemon status requires local IPC", "enable ipc.enabled and start elarkd")
+		return DaemonStatus{}, false
+	}
+	if strings.TrimSpace(socketPath) == "" {
+		r.add(CheckDaemonSocket, StatusFailed, "ipc socket path is empty", "")
+		r.add(CheckDaemonStatus, StatusFailed, "daemon status requires local IPC", "ipc.socket_path is empty")
+		return DaemonStatus{}, false
+	}
+
 	if r.opts.Daemon != nil {
 		status, err := r.opts.Daemon.Status(ctx, DaemonStatusRequest{
 			ConfigPath: r.report.ConfigPath,
 			SocketPath: socketPath,
-			Host:       r.report.Host,
 			NodeName:   r.report.NodeName,
 		})
 		if err != nil {
+			r.add(CheckDaemonSocket, StatusFailed, "daemon socket is not reachable", err.Error())
 			r.add(CheckDaemonStatus, StatusFailed, "daemon status request failed", err.Error())
 			return DaemonStatus{}, false
 		}
@@ -369,16 +328,6 @@ func (r *runner) checkDaemon(ctx context.Context, socketPath string) (DaemonStat
 		return status, true
 	}
 
-	if r.cfg == nil || !r.cfg.IPC.Enabled {
-		r.add(CheckDaemonSocket, StatusSkipped, "ipc is disabled in config", "")
-		r.add(CheckDaemonStatus, StatusSkipped, "daemon status was not requested", "no daemon probe configured")
-		return DaemonStatus{}, false
-	}
-	if strings.TrimSpace(socketPath) == "" {
-		r.add(CheckDaemonSocket, StatusFailed, "ipc socket path is empty", "")
-		r.add(CheckDaemonStatus, StatusSkipped, "daemon status was not requested", "no daemon probe configured")
-		return DaemonStatus{}, false
-	}
 	if err := checkSocketFile(socketPath); err != nil {
 		r.add(CheckDaemonSocket, StatusFailed, "daemon socket is not ready", err.Error())
 		r.add(CheckDaemonStatus, StatusSkipped, "daemon status was not requested", "socket check failed")
@@ -394,40 +343,6 @@ func (r *runner) checkDaemon(ctx context.Context, socketPath string) (DaemonStat
 	r.add(CheckDaemonSocket, StatusOK, "daemon socket accepts connections", socketPath)
 	r.add(CheckDaemonStatus, StatusSkipped, "daemon status was not requested", "no daemon probe configured")
 	return DaemonStatus{}, false
-}
-
-func (r *runner) checkLark(ctx context.Context, host config.HostConfig, hasHost bool) {
-	if r.opts.Lark == nil {
-		r.add(CheckTokenRefresh, StatusSkipped, "lark client was not configured", "")
-		r.add(CheckBotOpenID, StatusSkipped, "lark client was not configured", "")
-		r.add(CheckChat, StatusSkipped, "lark client was not configured", "")
-		r.add(CheckPeerBot, StatusSkipped, "lark client was not configured", "")
-		r.add(CheckBootstrap, StatusSkipped, "lark client was not configured", "")
-		return
-	}
-
-	token, err := r.opts.Lark.TenantAccessToken(ctx)
-	if err != nil {
-		r.add(CheckTokenRefresh, StatusFailed, "tenant access token refresh failed", err.Error())
-	} else if strings.TrimSpace(token) == "" {
-		r.add(CheckTokenRefresh, StatusFailed, "tenant access token refresh returned an empty token", "")
-	} else {
-		r.secrets = appendSecret(r.secrets, token)
-		r.add(CheckTokenRefresh, StatusOK, "tenant access token can be refreshed", "")
-	}
-
-	r.add(CheckBotOpenID, StatusSkipped, "bot open_id lookup is not performed by doctor", "")
-
-	if !hasHost {
-		r.add(CheckChat, StatusSkipped, "host-specific chat check was skipped", "")
-		r.add(CheckPeerBot, StatusSkipped, "host-specific peer bot check was skipped", "")
-		r.add(CheckBootstrap, StatusSkipped, "host-specific bootstrap check was skipped", "")
-		return
-	}
-
-	r.add(CheckChat, StatusSkipped, "chat availability check is not performed by doctor", host.ChatID)
-	r.add(CheckPeerBot, StatusSkipped, "peer bot membership check is not performed by doctor", host.PeerBotOpenID)
-	r.add(CheckBootstrap, StatusSkipped, "bootstrap history check is not performed by doctor", "")
 }
 
 func (r *runner) checkEventStatus(status DaemonStatus, hasStatus bool) {
@@ -470,7 +385,7 @@ func checkSocketFile(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("daemon socket %s does not exist; run elark daemon start", path)
+			return fmt.Errorf("daemon socket %s does not exist; run elarkd start", path)
 		}
 		return fmt.Errorf("stat daemon socket %s: %w", path, err)
 	}

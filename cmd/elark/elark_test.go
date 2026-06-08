@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hachiwii/exec-over-lark/internal/config"
-	"github.com/hachiwii/exec-over-lark/internal/doctor"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
 )
 
@@ -112,6 +110,16 @@ func TestConfigSocketIsUsedWithoutPrintingSecret(t *testing.T) {
 	if got := dialer.socketPath; got != socketPath {
 		t.Fatalf("socket path = %q, want %q", got, socketPath)
 	}
+	if len(fake.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(fake.starts))
+	}
+	start := fake.starts[0]
+	if start.HostConfig.ChatID != "oc_dev" || start.HostConfig.PeerBotOpenID != "ou_server" || start.HostConfig.DefaultCWD != "/srv/app" {
+		t.Fatalf("host config = %#v, want config file host content", start.HostConfig)
+	}
+	if start.Cwd != "/srv/app" {
+		t.Fatalf("cwd = %q, want host default cwd", start.Cwd)
+	}
 	combined := stdout.String() + stderr.String()
 	if strings.Contains(combined, "super-secret-value") || strings.Contains(combined, "app_secret") {
 		t.Fatalf("CLI output leaked secret material: %q", combined)
@@ -163,8 +171,8 @@ func TestDaemonUnavailablePrompt(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "elark daemon start") {
-		t.Fatalf("stderr = %q, want daemon start hint", stderr.String())
+	if !strings.Contains(stderr.String(), "elarkd start") {
+		t.Fatalf("stderr = %q, want elarkd start hint", stderr.String())
 	}
 }
 
@@ -205,41 +213,41 @@ func TestHostsAndDoctorDoNotPrintSecrets(t *testing.T) {
 	})
 
 	t.Run("doctor", func(t *testing.T) {
-		startTestUnixSocket(t, filepath.Join(dir, "elarkd.sock"))
-		fakeLark := &fakeDoctorLark{
-			token: "tenant-token-never-print-me",
+		fake := &fakeClient{
+			status: ipc.DaemonStatus{
+				Running:    true,
+				SocketPath: filepath.Join(dir, "elarkd.sock"),
+				Event:      ipc.EventConnectionStatus{Checked: true, Connected: true},
+				Outbound:   ipc.OutboundQueueStatus{Checked: true},
+			},
 		}
-		app, stdout, stderr := newTestApp(&fakeClient{}, nil)
-		app.newLarkClient = func(*config.Config) (doctor.LarkClient, error) {
-			return fakeLark, nil
-		}
-		code := app.run([]string{"--config", configPath, "doctor", "macmini"})
+		app, stdout, stderr := newTestApp(fake, nil)
+		code := app.run([]string{"--config", configPath, "doctor"})
 		if code != 0 {
 			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 		}
 		combined := stdout.String() + stderr.String()
 		for _, want := range []string{
-			"exec-over-lark doctor macmini",
+			"exec-over-lark doctor",
 			"[ok] config_load",
-			"[ok] host_config",
+			"[ok] daemon_status",
 			"[ok] daemon_socket",
-			"[ok] token_refresh",
-			"[skipped] bot_open_id",
-			"[skipped] chat",
-			"[skipped] peer_bot",
-			"[skipped] bootstrap",
+			"[ok] event_connection",
+			"[ok] outbound_queue",
 		} {
 			if !strings.Contains(combined, want) {
 				t.Fatalf("output = %q, want %q", combined, want)
 			}
 		}
-		if fakeLark.tokenCalls != 1 {
-			t.Fatalf("doctor token calls = %d, want 1", fakeLark.tokenCalls)
+		if len(fake.statusRequests) != 1 {
+			t.Fatalf("doctor status requests = %d, want 1", len(fake.statusRequests))
 		}
-		if strings.Contains(combined, "ping_root_message") {
-			t.Fatalf("doctor still reports ping_root_message: %q", combined)
+		for _, forbidden := range []string{"host_config", "token_refresh", "bot_open_id", "chat", "peer_bot", "bootstrap", "ping_root_message"} {
+			if strings.Contains(combined, forbidden) {
+				t.Fatalf("doctor still reports %s: %q", forbidden, combined)
+			}
 		}
-		if strings.Contains(combined, "never-print-me") || strings.Contains(combined, "app_secret") || strings.Contains(combined, "tenant-token-never-print-me") {
+		if strings.Contains(combined, "never-print-me") || strings.Contains(combined, "app_secret") {
 			t.Fatalf("doctor leaked secret material: %q", combined)
 		}
 	})
@@ -297,9 +305,6 @@ func newTestApp(client *fakeClient, stdin io.Reader) (*app, *bytes.Buffer, *byte
 		stderr:      stderr,
 		dial:        dialer.dial,
 		startDaemon: func(context.Context, string, io.Writer, io.Writer) error { return nil },
-		newLarkClient: func(*config.Config) (doctor.LarkClient, error) {
-			return &fakeDoctorLark{token: "tenant-token"}, nil
-		},
 		getenv: func(key string) string {
 			switch key {
 			case "LINES":
@@ -327,13 +332,15 @@ func (d *recordingDialer) dial(ctx context.Context, socketPath string) (daemonCl
 }
 
 type fakeClient struct {
-	starts   []ipc.StartSessionRequest
-	stdin    [][]byte
-	resizes  [][2]int
-	signals  []string
-	closes   []string
-	messages []ipc.Message
-	closed   bool
+	starts         []ipc.StartSessionRequest
+	stdin          [][]byte
+	resizes        [][2]int
+	signals        []string
+	closes         []string
+	messages       []ipc.Message
+	status         ipc.DaemonStatus
+	statusRequests []ipc.StatusRequest
+	closed         bool
 }
 
 func (f *fakeClient) StartSession(ctx context.Context, req ipc.StartSessionRequest) error {
@@ -361,6 +368,14 @@ func (f *fakeClient) CloseSession(ctx context.Context, requestID, reason string)
 	return nil
 }
 
+func (f *fakeClient) Status(ctx context.Context, req ipc.StatusRequest) (ipc.DaemonStatus, error) {
+	f.statusRequests = append(f.statusRequests, req)
+	if !f.status.Running && !f.status.Event.Checked && !f.status.Outbound.Checked {
+		return ipc.DaemonStatus{Running: true}, nil
+	}
+	return f.status, nil
+}
+
 func (f *fakeClient) Receive(ctx context.Context) (ipc.Message, error) {
 	if len(f.messages) == 0 {
 		return ipc.Message{}, errors.New("no fake message")
@@ -376,16 +391,6 @@ func (f *fakeClient) Receive(ctx context.Context) (ipc.Message, error) {
 func (f *fakeClient) Close() error {
 	f.closed = true
 	return nil
-}
-
-type fakeDoctorLark struct {
-	token      string
-	tokenCalls int
-}
-
-func (f *fakeDoctorLark) TenantAccessToken(context.Context) (string, error) {
-	f.tokenCalls++
-	return f.token, nil
 }
 
 func startTestUnixSocket(t *testing.T, path string) {

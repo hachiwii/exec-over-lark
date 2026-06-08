@@ -21,7 +21,7 @@ import (
 	"github.com/hachiwii/exec-over-lark/internal/config"
 	"github.com/hachiwii/exec-over-lark/internal/doctor"
 	"github.com/hachiwii/exec-over-lark/internal/ipc"
-	"github.com/hachiwii/exec-over-lark/internal/lark"
+	"github.com/hachiwii/exec-over-lark/internal/outbound"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -35,23 +35,22 @@ type daemonClient interface {
 	Resize(context.Context, string, int, int) error
 	Signal(context.Context, string, string) error
 	CloseSession(context.Context, string, string) error
+	Status(context.Context, ipc.StatusRequest) (ipc.DaemonStatus, error)
 	Receive(context.Context) (ipc.Message, error)
 	Close() error
 }
 
 type dialFunc func(context.Context, string) (daemonClient, error)
 type daemonStarter func(context.Context, string, io.Writer, io.Writer) error
-type larkClientFactory func(*config.Config) (doctor.LarkClient, error)
 
 type app struct {
 	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
 
-	dial          dialFunc
-	startDaemon   daemonStarter
-	newLarkClient larkClientFactory
-	getenv        func(string) string
+	dial        dialFunc
+	startDaemon daemonStarter
+	getenv      func(string) string
 }
 
 type ttyMode int
@@ -118,13 +117,7 @@ func newApp() *app {
 		stderr:      os.Stderr,
 		dial:        dialIPC,
 		startDaemon: startDaemonProcess,
-		newLarkClient: func(cfg *config.Config) (doctor.LarkClient, error) {
-			return lark.NewClient(lark.ClientConfig{
-				AppID:     cfg.Lark.AppID,
-				AppSecret: cfg.Lark.AppSecret,
-			})
-		},
-		getenv: os.Getenv,
+		getenv:      os.Getenv,
 	}
 }
 
@@ -257,13 +250,10 @@ func parseArgs(args []string) (parsedCommand, error) {
 		}
 		cmd.kind = commandHosts
 	case "doctor":
-		if len(positionals) > 2 {
-			return cmd, errors.New("doctor accepts at most one host")
+		if len(positionals) != 1 {
+			return cmd, errors.New("doctor does not take arguments")
 		}
 		cmd.kind = commandDoctor
-		if len(positionals) == 2 {
-			cmd.host = positionals[1]
-		}
 	case "daemon":
 		if len(positionals) != 2 {
 			return cmd, errors.New("daemon requires one subcommand: start, status, or stop")
@@ -318,10 +308,17 @@ func optionValue(args []string, index int, name string) (string, int, error) {
 }
 
 func (a *app) runRemote(cmd parsedCommand) int {
-	socketPath, err := resolveSocketPath(cmd.opts)
+	cfg, socketPath, hostCfg, err := loadRemoteStartConfig(cmd.opts, cmd.host)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "elark: %v\n", err)
-		return 1
+		if !(strings.TrimSpace(cmd.opts.socketPath) != "" && strings.TrimSpace(cmd.opts.configPath) == "" && isMissingConfigError(err)) {
+			fmt.Fprintf(a.stderr, "elark: %v\n", err)
+			return 1
+		}
+		socketPath, err = resolveSocketPath(cmd.opts)
+		if err != nil {
+			fmt.Fprintf(a.stderr, "elark: %v\n", err)
+			return 1
+		}
 	}
 
 	ctx, cancel := commandContext(cmd.opts)
@@ -329,7 +326,7 @@ func (a *app) runRemote(cmd parsedCommand) int {
 
 	client, err := a.dial(ctx, socketPath)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "elark: local elarkd is not running at %s; run `elark daemon start`\n", socketPath)
+		fmt.Fprintf(a.stderr, "elark: local elarkd is not running at %s; run `elarkd start`\n", socketPath)
 		if cmd.opts.debug {
 			fmt.Fprintf(a.stderr, "elark: dial error: %v\n", err)
 		}
@@ -345,13 +342,19 @@ func (a *app) runRemote(cmd parsedCommand) int {
 
 	rows, cols := terminalSizeFromEnv(a.getenv)
 	start := ipc.StartSessionRequest{
-		RequestID: requestID,
-		Host:      cmd.host,
-		Cmd:       cmd.command,
-		Pty:       shouldAllocatePTY(cmd),
-		Cwd:       cmd.opts.cwd,
-		Rows:      rows,
-		Cols:      cols,
+		RequestID:  requestID,
+		Host:       cmd.host,
+		HostConfig: hostCfg,
+		Cmd:        cmd.command,
+		Pty:        shouldAllocatePTY(cmd),
+		Cwd:        cmd.opts.cwd,
+		Rows:       rows,
+		Cols:       cols,
+	}
+	if strings.TrimSpace(start.Cwd) == "" && cfg != nil {
+		if host, ok := cfg.Hosts[cmd.host]; ok {
+			start.Cwd = host.DefaultCWD
+		}
 	}
 	if err := client.StartSession(ctx, start); err != nil {
 		fmt.Fprintf(a.stderr, "elark: start session: %v\n", err)
@@ -494,7 +497,6 @@ func (a *app) runDoctor(cmd parsedCommand) int {
 
 	opts := doctor.Options{
 		ConfigPath: cmd.opts.configPath,
-		Host:       cmd.host,
 	}
 
 	cfg, err := config.Load(cmd.opts.configPath)
@@ -505,12 +507,11 @@ func (a *app) runDoctor(cmd parsedCommand) int {
 		}
 		opts.Config = cfg
 		opts.ConfigPath = ""
-		if a.newLarkClient != nil {
-			larkClient, err := a.newLarkClient(cfg)
-			if err != nil {
-				opts.Lark = failingLarkClient{err: fmt.Errorf("create lark client: %w", err)}
-			} else {
-				opts.Lark = larkClient
+		socketPath, socketErr := resolveSocketPathFromRuntimeConfig(cfg)
+		if socketErr == nil {
+			opts.Daemon = ipcDaemonProbe{
+				dial:       a.dial,
+				socketPath: socketPath,
 			}
 		}
 	}
@@ -536,14 +537,6 @@ func cloneConfig(cfg *config.Config) *config.Config {
 	}
 	out.Exec.AllowedChatIDs = append([]string(nil), cfg.Exec.AllowedChatIDs...)
 	return &out
-}
-
-type failingLarkClient struct {
-	err error
-}
-
-func (c failingLarkClient) TenantAccessToken(context.Context) (string, error) {
-	return "", c.err
 }
 
 func (a *app) runDaemon(cmd parsedCommand) int {
@@ -604,7 +597,7 @@ func (a *app) runKill(cmd parsedCommand) int {
 
 	client, err := a.dial(ctx, socketPath)
 	if err != nil {
-		fmt.Fprintf(a.stderr, "elark: local elarkd is not running at %s; run `elark daemon start`\n", socketPath)
+		fmt.Fprintf(a.stderr, "elark: local elarkd is not running at %s; run `elarkd start`\n", socketPath)
 		return 1
 	}
 	defer client.Close()
@@ -637,7 +630,7 @@ func commandContext(opts globalOptions) (context.Context, context.CancelFunc) {
 }
 
 func startDaemonProcess(ctx context.Context, configPath string, stdout, stderr io.Writer) error {
-	args := []string{}
+	args := []string{"run"}
 	if strings.TrimSpace(configPath) != "" {
 		path, err := config.ResolvePath(configPath)
 		if err != nil {
@@ -656,6 +649,93 @@ func startDaemonProcess(ctx context.Context, configPath string, stdout, stderr i
 	return nil
 }
 
+type ipcDaemonProbe struct {
+	dial       dialFunc
+	socketPath string
+}
+
+func (p ipcDaemonProbe) Status(ctx context.Context, req doctor.DaemonStatusRequest) (doctor.DaemonStatus, error) {
+	if p.dial == nil {
+		return doctor.DaemonStatus{}, errors.New("ipc dialer is nil")
+	}
+	client, err := p.dial(ctx, p.socketPath)
+	if err != nil {
+		return doctor.DaemonStatus{}, err
+	}
+	defer client.Close()
+
+	status, err := client.Status(ctx, ipc.StatusRequest{
+		ConfigPath: req.ConfigPath,
+		SocketPath: req.SocketPath,
+		NodeName:   req.NodeName,
+	})
+	if err != nil {
+		return doctor.DaemonStatus{}, err
+	}
+	return doctorStatusFromIPC(status), nil
+}
+
+func doctorStatusFromIPC(status ipc.DaemonStatus) doctor.DaemonStatus {
+	out := doctor.DaemonStatus{
+		Running:       status.Running,
+		SocketPath:    status.SocketPath,
+		SelfBotOpenID: status.SelfBotOpenID,
+		Event: doctor.EventConnectionStatus{
+			Checked:         status.Event.Checked,
+			Connected:       status.Event.Connected,
+			LastConnectedAt: status.Event.LastConnectedAt,
+			LastEventAt:     status.Event.LastEventAt,
+			Error:           status.Event.Error,
+		},
+		Outbound: doctor.OutboundQueueStatus{
+			Checked:       status.Outbound.Checked,
+			PendingFrames: status.Outbound.PendingFrames,
+			LastSentAt:    status.Outbound.LastSentAt,
+			HasLastSent:   status.Outbound.HasLastSent,
+			NextFlushAt:   status.Outbound.NextFlushAt,
+			HasNextFlush:  status.Outbound.HasNextFlush,
+		},
+	}
+	for _, target := range status.Outbound.PendingTargets {
+		out.Outbound.PendingTargets = append(out.Outbound.PendingTargets, outbound.Target{
+			ChatID:        target.ChatID,
+			RootMessageID: target.RootMessageID,
+			MentionOpenID: target.MentionOpenID,
+		})
+	}
+	return out
+}
+
+func loadRemoteStartConfig(opts globalOptions, hostName string) (*config.Config, string, ipc.HostConfig, error) {
+	cfg, err := config.Load(opts.configPath)
+	if err != nil {
+		return nil, "", ipc.HostConfig{}, err
+	}
+	cfg = cloneConfig(cfg)
+	if strings.TrimSpace(opts.socketPath) != "" {
+		cfg.IPC.SocketPath = opts.socketPath
+	}
+	socketPath, err := resolveSocketPathFromRuntimeConfig(cfg)
+	if err != nil {
+		return nil, "", ipc.HostConfig{}, err
+	}
+	host, ok := cfg.Hosts[hostName]
+	if !ok {
+		return nil, "", ipc.HostConfig{}, fmt.Errorf("host %q is not defined in config", hostName)
+	}
+	return cfg, socketPath, ipcHostConfig(host), nil
+}
+
+func ipcHostConfig(host config.HostConfig) ipc.HostConfig {
+	return ipc.HostConfig{
+		ChatID:           host.ChatID,
+		PeerBotOpenID:    host.PeerBotOpenID,
+		Shell:            host.Shell,
+		StreamChunkBytes: host.StreamChunkBytes,
+		DefaultCWD:       host.DefaultCWD,
+	}
+}
+
 func resolveSocketPath(opts globalOptions) (string, error) {
 	if strings.TrimSpace(opts.socketPath) != "" {
 		return expandPath(opts.socketPath)
@@ -672,6 +752,13 @@ func resolveSocketPath(opts globalOptions) (string, error) {
 		return "", err
 	}
 	return expandPath(defaultSocketPath)
+}
+
+func resolveSocketPathFromRuntimeConfig(cfg *config.Config) (string, error) {
+	if cfg == nil || strings.TrimSpace(cfg.IPC.SocketPath) == "" {
+		return expandPath(defaultSocketPath)
+	}
+	return expandPath(cfg.IPC.SocketPath)
 }
 
 func resolveSocketPathFromConfig(opts globalOptions, cfg cliConfig) (string, error) {
@@ -879,7 +966,7 @@ func usage() string {
   elark [OPTIONS] HOST [COMMAND]
   elark [OPTIONS] HOST
   elark [OPTIONS] hosts
-  elark [OPTIONS] doctor [HOST]
+  elark [OPTIONS] doctor
   elark [OPTIONS] sessions
   elark [OPTIONS] attach <conn_id>
   elark [OPTIONS] kill <conn_id>

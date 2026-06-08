@@ -298,6 +298,28 @@ func (d *Local) Close(ctx context.Context, req ipc.CloseRequest) error {
 	return d.sessions.CloseLocal(ctx, req.RequestID, req.Reason)
 }
 
+func (d *Local) Status(_ context.Context, _ ipc.StatusRequest) (ipc.DaemonStatus, error) {
+	d.mu.RLock()
+	started := d.started
+	selfBotOpenID := d.selfBotOpenID
+	socketPath := ""
+	if d.ipcServer != nil {
+		socketPath = d.ipcServer.SocketPath()
+	}
+	d.mu.RUnlock()
+
+	return ipc.DaemonStatus{
+		Running:       started,
+		SocketPath:    socketPath,
+		SelfBotOpenID: selfBotOpenID,
+		Event: ipc.EventConnectionStatus{
+			Checked:   true,
+			Connected: started,
+		},
+		Outbound: outboundStatusFromQueue(d.queue),
+	}, nil
+}
+
 func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionRequest, subscriber session.Subscriber) (string, error) {
 	hostName := strings.TrimSpace(req.Host)
 	if hostName == "" {
@@ -314,6 +336,7 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 	if strings.TrimSpace(req.RequestID) == "" {
 		return "", ipc.NewRPCError(ipc.ErrorCodeBadRequest, "request_id is required", "")
 	}
+	host = mergeIPCStartHost(host, req.HostConfig)
 
 	cwd := firstLocalNonEmpty(req.Cwd, host.DefaultCWD)
 	shell := firstLocalNonEmpty(req.Shell, host.Shell)
@@ -360,10 +383,6 @@ func (d *Local) StartLocalSession(ctx context.Context, req ipc.StartSessionReque
 }
 
 func (d *Local) HandleLarkEvent(ctx context.Context, event lark.MessageEvent) error {
-	if !d.eventMatchesConfiguredHost(event) {
-		return ErrIgnoredEvent
-	}
-
 	err := d.sessions.ReceiveLocal(ctx, session.InboundMessage{
 		ConnID:        session.ConnID(event.RootMessageID, event.MessageID),
 		RootMessageID: event.RootMessageID,
@@ -391,15 +410,6 @@ func (d *Local) ConnIDForRequest(requestID string) (string, bool) {
 
 func (d *Local) LocalSessions() []session.Snapshot {
 	return d.sessions.LocalSessions()
-}
-
-func (d *Local) eventMatchesConfiguredHost(event lark.MessageEvent) bool {
-	for _, host := range d.cfg.Hosts {
-		if event.ChatID == host.ChatID && event.SenderOpenID == host.PeerBotOpenID {
-			return true
-		}
-	}
-	return false
 }
 
 func (d *Local) flushLoop(ctx context.Context) error {
@@ -515,6 +525,51 @@ func firstLocalNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func mergeIPCStartHost(base config.HostConfig, override ipc.HostConfig) config.HostConfig {
+	if strings.TrimSpace(override.ChatID) != "" {
+		base.ChatID = override.ChatID
+	}
+	if strings.TrimSpace(override.PeerBotOpenID) != "" {
+		base.PeerBotOpenID = override.PeerBotOpenID
+	}
+	if strings.TrimSpace(override.Shell) != "" {
+		base.Shell = override.Shell
+	}
+	if strings.TrimSpace(override.DefaultCWD) != "" {
+		base.DefaultCWD = override.DefaultCWD
+	}
+	if override.StreamChunkBytes > 0 {
+		base.StreamChunkBytes = override.StreamChunkBytes
+	}
+	return base
+}
+
+func outboundStatusFromQueue(q *outbound.Queue) ipc.OutboundQueueStatus {
+	if q == nil {
+		return ipc.OutboundQueueStatus{}
+	}
+	lastSentAt, hasLastSent := q.LastSentAt()
+	nextFlushAt, hasNextFlush := q.NextFlushAt()
+	targets := q.PendingTargets()
+	out := ipc.OutboundQueueStatus{
+		Checked:        true,
+		PendingFrames:  q.PendingLen(),
+		PendingTargets: make([]ipc.OutboundTarget, 0, len(targets)),
+		LastSentAt:     lastSentAt,
+		HasLastSent:    hasLastSent,
+		NextFlushAt:    nextFlushAt,
+		HasNextFlush:   hasNextFlush,
+	}
+	for _, target := range targets {
+		out.PendingTargets = append(out.PendingTargets, ipc.OutboundTarget{
+			ChatID:        target.ChatID,
+			RootMessageID: target.RootMessageID,
+			MentionOpenID: target.MentionOpenID,
+		})
+	}
+	return out
 }
 
 func cloneEnv(env map[string]string) map[string]string {

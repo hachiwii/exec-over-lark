@@ -34,7 +34,7 @@
 
 ### 从 Release 安装
 
-推荐使用一键安装脚本。脚本会检测 macOS/Linux 和 CPU 架构，从 GitHub latest release 选择匹配的归档，安装 `elark` 和 `elarkd`，并在结束时输出安装位置、生成初始配置的命令和启动后台进程的命令。
+推荐使用一键安装脚本。脚本会检测 macOS/Linux 和 CPU 架构，从 GitHub latest release 选择匹配的归档，安装 `elark` 和 `elarkd`，默认执行 `elarkd install` 注册后台服务，并在结束时输出安装位置、生成初始配置的命令和启动后台进程的命令。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hachiwii/exec-over-lark/main/scripts/install.sh | sh
@@ -46,9 +46,12 @@ curl -fsSL https://raw.githubusercontent.com/hachiwii/exec-over-lark/main/script
 curl -fsSL https://raw.githubusercontent.com/hachiwii/exec-over-lark/main/scripts/install.sh -o install.sh
 sh install.sh
 ELARK_INSTALL_DIR="$HOME/.local/bin" sh install.sh
+sh install.sh --system
+sh install.sh --no-install
 ```
 
 脚本优先安装到已经在 `PATH` 中的 `$HOME/.local/bin`，其次选择已有可写 `PATH` 目录；如果没有可写 `PATH` 目录，会创建 `$HOME/.local/bin` 并提示把它加入 `PATH`。
+传入 `--system` 时，脚本会用 `sudo elarkd install --system` 安装系统级 daemon；传入 `--no-install` 时只安装二进制，不自动注册 daemon。
 
 如果还没有发布 GitHub release，`releases/latest` 会返回 404；先发布一个包含对应系统归档的 release 后再执行脚本。
 
@@ -80,14 +83,16 @@ elarkd init --help
 
 ```bash
 elarkd init --client
-elark daemon start
+elarkd start
 ```
 
-远端机器通常生成 server 配置并直接运行 `elarkd`：
+远端机器通常生成 server 配置并安装或前台运行 `elarkd`：
 
 ```bash
 elarkd init --server
-elarkd --config ~/.elark/config.toml
+elarkd install
+elarkd start
+elarkd run --config ~/.elark/config.toml
 ```
 
 ### 从源码安装
@@ -260,20 +265,22 @@ stream_chunk_bytes = 12000
 本地侧：
 
 ```bash
-elark daemon start
-elark daemon status
+elarkd install
+elarkd start
+elark doctor
 ```
 
 也可以直接运行：
 
 ```bash
-elarkd --config ~/.elark/config.toml
+elarkd run --config ~/.elark/config.toml
 ```
 
 远端侧通常用 systemd、launchd 或进程管理器长期运行：
 
 ```bash
-elarkd --config ~/.elark/config.toml
+elarkd install
+elarkd start
 ```
 
 ### 查看和诊断
@@ -284,11 +291,16 @@ elarkd --config ~/.elark/config.toml
 elark hosts
 ```
 
-输出 doctor 报告。`elark doctor` 会检查本地配置和本地 daemon 状态，并刷新 Lark tenant token 来校验 `app_id`/`app_secret` 是否有效；除此之外不会查询 bot、chat、peer bot、bootstrap 历史，也不会向群里发送 ping 或其他消息。指定 host 时，只会校验本地 host 配置，并把该 host 传给本地 daemon 状态探测；bot、chat、peer bot、bootstrap 等检查会在报告里显示 `skipped`：
+输出本地 CLI doctor 报告。`elark doctor` 只检查本地配置是否有效、`ipc.enabled` 是否开启、本地 daemon socket 是否可连接，以及 daemon 返回的 event/outbound 状态；它不会刷新 Lark token、不会查询 bot/chat/peer bot/bootstrap，也不会向群里发送 ping 或其他消息：
 
 ```bash
 elark doctor
-elark doctor macmini
+```
+
+检查 `elarkd` 自身能否正常启动时使用 `elarkd doctor`。它会检查配置文件并刷新 Lark tenant token 来校验 `app_id`/`app_secret` 是否有效，不发送消息：
+
+```bash
+elarkd doctor
 ```
 
 ### 执行命令

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/hachiwii/exec-over-lark/internal/config"
@@ -24,14 +25,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runLoopbackE2E(args, stdout, stderr)
 	}
 
-	if len(args) > 0 && args[0] == "init" {
-		return runInit(args[1:], stdout, stderr)
+	if len(args) == 0 {
+		return runForeground(args, stdout, stderr)
 	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		printUsage(stdout)
+		return 0
+	case "run":
+		return runForeground(args[1:], stdout, stderr)
+	case "init":
+		return runInit(args[1:], stdout, stderr)
+	case "doctor":
+		return runElarkdDoctor(args[1:], stdout, stderr)
+	case "install", "uninstall", "start", "restart", "stop":
+		return runServiceCommand(args[0], args[1:], stdout, stderr)
+	default:
+		if strings.HasPrefix(args[0], "-") {
+			return runForeground(args, stdout, stderr)
+		}
+		fmt.Fprintf(stderr, "unknown elarkd command %q\n", args[0])
+		printUsage(stderr)
+		return 2
+	}
+}
 
+func runForeground(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("elarkd", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		printUsage(fs.Output())
+		printRunUsage(fs.Output())
 	}
 	configPath := fs.String("config", "", "path to config file")
 	if err := fs.Parse(args); err != nil {
@@ -141,11 +164,33 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
-  elarkd [--config PATH]
+  elarkd run [--config PATH]
   elarkd init (--client|--server) [--config PATH] [--force]
+  elarkd install [--config PATH] [--system]
+  elarkd uninstall [--system]
+  elarkd start [--system]
+  elarkd restart [--system]
+  elarkd stop [--system]
+  elarkd doctor [--config PATH]
 
 Commands:
-  init    write a client or server config template
+  run        run elarkd in the foreground
+  init       write a client or server config template
+  install    install the background daemon service
+  uninstall  remove the installed daemon service
+  start      start the installed daemon service
+  restart    restart the installed daemon service
+  stop       stop the installed daemon service
+  doctor     check config validity and Lark token refresh
+
+Options:
+  -config PATH  path to config file
+`)
+}
+
+func printRunUsage(w io.Writer) {
+	fmt.Fprint(w, `Usage:
+  elarkd run [--config PATH]
 
 Options:
   -config PATH  path to config file
