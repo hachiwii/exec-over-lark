@@ -443,7 +443,7 @@ func (m *Manager) ReceiveLocal(ctx context.Context, msg InboundMessage) error {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrSessionNotFound, connID)
 	}
-	if err := sess.base.ensurePeer(msg.ChatID, msg.SenderOpenID); err != nil {
+	if err := sess.base.ensurePeer(msg.ChatID, ""); err != nil {
 		m.mu.Unlock()
 		return err
 	}

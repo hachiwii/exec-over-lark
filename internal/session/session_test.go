@@ -36,7 +36,7 @@ func TestLocalRoutesOutputAndCleansUpOnExit(t *testing.T) {
 	if err := manager.ReceiveLocal(context.Background(), InboundMessage{
 		RootMessageID: "om_root",
 		ChatID:        "oc_chat",
-		SenderOpenID:  "ou_server",
+		SenderOpenID:  "cli_server_app",
 		Frames:        frames,
 	}); err != nil {
 		t.Fatalf("ReceiveLocal returned error: %v", err)
@@ -247,7 +247,7 @@ func TestRemoteGapTimeoutSendsErrorAndCleansUp(t *testing.T) {
 	waitRemoteSessionsLen(t, manager, 0)
 }
 
-func TestUnauthorizedPeerIsRejected(t *testing.T) {
+func TestUnauthorizedChatIsRejected(t *testing.T) {
 	manager := New(WithOutbound(newFakeOutbound()))
 	if err := manager.RegisterLocal(LocalStart{
 		RequestID:     "req-1",

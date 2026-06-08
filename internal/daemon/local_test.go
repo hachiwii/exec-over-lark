@@ -212,7 +212,7 @@ func TestHandleLarkEventDistributesRemoteFramesToSubscriber(t *testing.T) {
 		MessageID:     "om_reply",
 		RootMessageID: "om_root",
 		ChatID:        "oc_chat",
-		SenderOpenID:  "ou_peer_bot",
+		SenderOpenID:  "cli_peer_app",
 		Frames: []protocol.Frame{
 			jsonFrame(t, 1, protocol.TypeStartAck, protocol.StartAckPayload{Heartbeat: protocol.HeartbeatConfig{Interval: "10s", Timeout: "45s"}}),
 			{Seq: 2, Type: protocol.TypeStdout, Payload: []byte("hello\n")},
