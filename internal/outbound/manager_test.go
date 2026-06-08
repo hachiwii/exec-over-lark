@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"sync"
 	"testing"
@@ -44,6 +45,95 @@ func TestManagerRetriesRetryableFailureWithoutDroppingFrames(t *testing.T) {
 		t.Fatalf("messages = %d, want initial attempt and retry", got)
 	}
 	assertMessageFrameSeqs(t, messages[1], 1)
+}
+
+func TestManagerSchedulesNextFlushWhileSendInFlight(t *testing.T) {
+	frame1 := protocol.Frame{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("one")}
+	text1, err := protocol.EncodeFrames([]protocol.Frame{frame1})
+	if err != nil {
+		t.Fatalf("EncodeFrames returned error: %v", err)
+	}
+	sender := newBlockingReplySender()
+	manager := startTestManager(t, sender, ManagerOptions{
+		SendCooldown:      10 * time.Millisecond,
+		RequestLimitBytes: len(text1),
+		RequestSizer:      textSize,
+	})
+
+	if err := manager.RegisterConnection(RegisterConnectionRequest{
+		ConnID:            "om_root",
+		Role:              RoleRemote,
+		Target:            testTarget("om_root"),
+		NextSeq:           1,
+		HeartbeatInterval: time.Hour,
+	}); err != nil {
+		t.Fatalf("RegisterConnection returned error: %v", err)
+	}
+	if err := manager.Enqueue(context.Background(), "om_root", protocol.TypeStdout, []byte("one")); err != nil {
+		t.Fatalf("Enqueue first returned error: %v", err)
+	}
+	if err := manager.Enqueue(context.Background(), "om_root", protocol.TypeStdout, []byte("two")); err != nil {
+		t.Fatalf("Enqueue second returned error: %v", err)
+	}
+
+	if got := waitBlockingSend(t, sender.calls); got != 1 {
+		t.Fatalf("first call = %d, want 1", got)
+	}
+	if got := waitBlockingSend(t, sender.calls); got != 2 {
+		t.Fatalf("second call while first in flight = %d, want 2", got)
+	}
+	close(sender.releaseFirst)
+}
+
+func TestRetryableReplyFailureRequeuesPoppedBatchAtHead(t *testing.T) {
+	retryable := &lark.APIError{Status: 500, Path: "/reply"}
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	chat := &chatQueue{
+		manager:      &Manager{conns: make(map[string]*chatQueue)},
+		chatID:       "oc_chat",
+		cooldown:     time.Millisecond,
+		conns:        make(map[string]*connQueue),
+		rescheduleCh: make(chan struct{}, 1),
+		clock:        fixedClock{now: now},
+		logger:       slog.Default(),
+	}
+	conn := &connQueue{
+		connID:   "om_root",
+		role:     RoleRemote,
+		target:   testTarget("om_root"),
+		inFlight: 1,
+		frames: []queuedFrame{{
+			frame:     protocol.Frame{Seq: 2, Type: protocol.TypeStdout, Payload: []byte("new")},
+			createdAt: now.Add(time.Millisecond),
+		}},
+	}
+	chat.conns[conn.connID] = conn
+	batch := sendBatch{
+		kind:       sendKindReply,
+		connID:     conn.connID,
+		role:       conn.role,
+		target:     conn.target,
+		frames:     []protocol.Frame{{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("retry")}},
+		frameCount: 1,
+		queuedFrames: []queuedFrame{{
+			frame:     protocol.Frame{Seq: 1, Type: protocol.TypeStdout, Payload: []byte("retry")},
+			createdAt: now,
+		}},
+	}
+
+	chat.commitReplyResult(context.Background(), batch, retryable)
+
+	if conn.inFlight != 0 {
+		t.Fatalf("inFlight = %d, want 0", conn.inFlight)
+	}
+	got := make([]uint64, 0, len(conn.frames))
+	for _, queued := range conn.frames {
+		got = append(got, queued.frame.Seq)
+	}
+	want := []uint64{1, 2}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("queued seqs = %v, want %v", got, want)
+	}
 }
 
 func TestManagerDropsConnectionOnPermanentSendFailure(t *testing.T) {
@@ -251,9 +341,9 @@ func TestChatSelectsOldestNormalPendingItemAcrossRootAndConnection(t *testing.T)
 		}},
 	}
 
-	batch, err := chat.selectBatchLocked(now)
+	batch, err := chat.selectAndPopBatchLocked(now)
 	if err != nil {
-		t.Fatalf("selectBatchLocked returned error: %v", err)
+		t.Fatalf("selectAndPopBatchLocked returned error: %v", err)
 	}
 	if batch.kind != sendKindReply || batch.connID != "om_root" {
 		t.Fatalf("batch = %#v, want older reply connection", batch)
@@ -267,6 +357,44 @@ type managerSentMessage struct {
 	rootMessageID string
 	mentionOpenID string
 	text          string
+}
+
+type blockingReplySender struct {
+	mu           sync.Mutex
+	calls        chan int
+	releaseFirst chan struct{}
+	callCount    int
+}
+
+func newBlockingReplySender() *blockingReplySender {
+	return &blockingReplySender{
+		calls:        make(chan int, 4),
+		releaseFirst: make(chan struct{}),
+	}
+}
+
+func (s *blockingReplySender) SendRootMessage(context.Context, Role, string, string, string) (RootMessage, error) {
+	return RootMessage{}, errors.New("unexpected root send")
+}
+
+func (s *blockingReplySender) ReplyRootMessage(ctx context.Context, role Role, chatID, rootMessageID, mentionOpenID, text string) (string, error) {
+	_, _, _, _, _ = role, chatID, rootMessageID, mentionOpenID, text
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	s.callCount++
+	call := s.callCount
+	s.mu.Unlock()
+	s.calls <- call
+	if call == 1 {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-s.releaseFirst:
+		}
+	}
+	return "om_reply", nil
 }
 
 type managerTestSender struct {
@@ -339,7 +467,7 @@ func (s *managerTestSender) Messages() []managerSentMessage {
 	return append([]managerSentMessage(nil), s.messages...)
 }
 
-func startTestManager(t *testing.T, sender *managerTestSender, opts ManagerOptions) *Manager {
+func startTestManager(t *testing.T, sender ManagerSender, opts ManagerOptions) *Manager {
 	t.Helper()
 	opts.Sender = sender
 	if opts.RequestLimitBytes == 0 {
@@ -369,6 +497,25 @@ func waitManagerSend(t *testing.T, calls <-chan error) error {
 		t.Fatal("timed out waiting for outbound send")
 		return nil
 	}
+}
+
+func waitBlockingSend(t *testing.T, calls <-chan int) int {
+	t.Helper()
+	select {
+	case call := <-calls:
+		return call
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocked outbound send")
+		return 0
+	}
+}
+
+type fixedClock struct {
+	now time.Time
+}
+
+func (c fixedClock) Now() time.Time {
+	return c.now
 }
 
 func testTarget(rootMessageID string) Target {

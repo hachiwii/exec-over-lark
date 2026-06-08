@@ -404,7 +404,7 @@ func (w *RecvWindow) OfferAt(frame Frame, now time.Time) (RecvResult, error) {
 
 	if len(w.PendingFrames) == 0 {
 		w.closeGap()
-	} else if !w.GapOpen {
+	} else {
 		w.GapOpen = true
 		w.GapStartedAt = now
 	}

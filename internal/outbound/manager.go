@@ -133,8 +133,6 @@ type chatQueue struct {
 	rootSeq  uint64
 	rootJobs map[string]*rootOpenJob
 
-	flushing bool
-
 	rescheduleCh chan struct{}
 
 	sender ManagerSender
@@ -159,6 +157,7 @@ type connQueue struct {
 
 	closeAfterDrained bool
 	dropped           bool
+	inFlight          int
 
 	onDrop    func(context.Context, DropReason)
 	onDrained func(context.Context)
@@ -180,7 +179,8 @@ type rootOpenJob struct {
 
 	resultCh chan rootOpenResult
 
-	onDrop func(context.Context, DropReason)
+	inFlight bool
+	onDrop   func(context.Context, DropReason)
 }
 
 type rootOpenResult struct {
@@ -205,8 +205,9 @@ type sendBatch struct {
 
 	rootJobID string
 
-	frames     []protocol.Frame
-	frameCount int
+	frames       []protocol.Frame
+	queuedFrames []queuedFrame
+	frameCount   int
 }
 
 func NewManager(opts ManagerOptions) (*Manager, error) {
@@ -367,7 +368,7 @@ func (m *Manager) MarkCloseAfterDrained(connID string) {
 	chat.mu.Lock()
 	if conn, ok := chat.conns[connID]; ok {
 		conn.closeAfterDrained = true
-		if len(conn.frames) == 0 {
+		if len(conn.frames) == 0 && conn.inFlight == 0 {
 			drained = conn.onDrained
 			removeConn = true
 			delete(chat.conns, connID)
@@ -520,6 +521,9 @@ func (c *chatQueue) status() ChatStatus {
 		Connections:    len(c.conns),
 	}
 	for _, job := range c.rootJobs {
+		if job.inFlight {
+			continue
+		}
 		status.PendingFrames++
 		status.PendingTargets = append(status.PendingTargets, job.target)
 	}
@@ -618,30 +622,44 @@ func (c *chatQueue) flushOnce(ctx context.Context) {
 		return
 	}
 
-	text, err := protocol.EncodeFrames(batch.frames)
-	if err == nil {
-		switch batch.kind {
-		case sendKindRoot:
-			var root RootMessage
-			root, err = c.sender.SendRootMessage(ctx, batch.role, batch.target.ChatID, batch.target.MentionOpenID, text)
-			c.commitRootResult(ctx, batch, root, err)
-		case sendKindReply:
-			_, err = c.sender.ReplyRootMessage(ctx, batch.role, batch.target.ChatID, batch.target.RootMessageID, batch.target.MentionOpenID, text)
-			c.commitReplyResult(ctx, batch, err)
-		}
-	} else {
-		c.commitReplyResult(ctx, batch, err)
-	}
+	go c.sendBatch(ctx, batch)
 	c.notifyReschedule()
+}
+
+func (c *chatQueue) sendBatch(ctx context.Context, batch sendBatch) {
+	text, err := protocol.EncodeFrames(batch.frames)
+	if err != nil {
+		c.commitSendError(ctx, batch, err)
+		return
+	}
+
+	switch batch.kind {
+	case sendKindRoot:
+		root, err := c.sender.SendRootMessage(ctx, batch.role, batch.target.ChatID, batch.target.MentionOpenID, text)
+		c.commitRootResult(ctx, batch, root, err)
+	case sendKindReply:
+		_, err := c.sender.ReplyRootMessage(ctx, batch.role, batch.target.ChatID, batch.target.RootMessageID, batch.target.MentionOpenID, text)
+		c.commitReplyResult(ctx, batch, err)
+	default:
+		c.notifyReschedule()
+	}
+}
+
+func (c *chatQueue) commitSendError(ctx context.Context, batch sendBatch, err error) {
+	switch batch.kind {
+	case sendKindRoot:
+		c.commitRootResult(ctx, batch, RootMessage{}, err)
+	case sendKindReply:
+		c.commitReplyResult(ctx, batch, err)
+	default:
+		c.notifyReschedule()
+	}
 }
 
 func (c *chatQueue) prepareBatch(now time.Time) (sendBatch, DropReason, func(context.Context, DropReason)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.flushing {
-		return sendBatch{}, DropReason{}, nil
-	}
-	batch, err := c.selectBatchLocked(now)
+	batch, err := c.selectAndPopBatchLocked(now)
 	if err != nil {
 		var tooLarge *FrameTooLargeError
 		if errors.As(err, &tooLarge) {
@@ -655,11 +673,12 @@ func (c *chatQueue) prepareBatch(now time.Time) (sendBatch, DropReason, func(con
 		c.replanLocked(now)
 		return sendBatch{}, DropReason{}, nil
 	}
-	c.flushing = true
+	c.markAttemptLocked(now)
+	c.replanLocked(now)
 	return batch, DropReason{}, nil
 }
 
-func (c *chatQueue) selectBatchLocked(now time.Time) (sendBatch, error) {
+func (c *chatQueue) selectAndPopBatchLocked(now time.Time) (sendBatch, error) {
 	if conn := c.selectHeartbeatConnLocked(now); conn != nil {
 		if len(conn.frames) == 0 {
 			frame, err := conn.seq.JSONFrame(protocol.TypeHeartbeat, protocol.HeartbeatPayload{})
@@ -668,15 +687,15 @@ func (c *chatQueue) selectBatchLocked(now time.Time) (sendBatch, error) {
 			}
 			conn.frames = append(conn.frames, queuedFrame{frame: frame, createdAt: now})
 		}
-		return c.buildReplyBatchLocked(conn)
+		return c.buildAndPopReplyBatchLocked(conn)
 	}
 	job := c.selectRootJobLocked()
 	conn := c.selectPendingConnLocked()
 	if job != nil && (conn == nil || !conn.frames[0].createdAt.Before(job.createdAt)) {
-		return c.buildRootBatchLocked(now, job)
+		return c.buildAndPopRootBatchLocked(now, job)
 	}
 	if conn != nil {
-		return c.buildReplyBatchLocked(conn)
+		return c.buildAndPopReplyBatchLocked(conn)
 	}
 	return sendBatch{}, nil
 }
@@ -697,6 +716,9 @@ func (c *chatQueue) selectHeartbeatConnLocked(now time.Time) *connQueue {
 func (c *chatQueue) selectRootJobLocked() *rootOpenJob {
 	var selected *rootOpenJob
 	for _, job := range c.rootJobs {
+		if job.inFlight {
+			continue
+		}
 		if selected == nil || job.createdAt.Before(selected.createdAt) {
 			selected = job
 		}
@@ -717,7 +739,7 @@ func (c *chatQueue) selectPendingConnLocked() *connQueue {
 	return selected
 }
 
-func (c *chatQueue) buildRootBatchLocked(now time.Time, job *rootOpenJob) (sendBatch, error) {
+func (c *chatQueue) buildAndPopRootBatchLocked(now time.Time, job *rootOpenJob) (sendBatch, error) {
 	fits, err := c.fits(job.target, []protocol.Frame{job.frame})
 	if err != nil {
 		return sendBatch{}, err
@@ -734,6 +756,7 @@ func (c *chatQueue) buildRootBatchLocked(now time.Time, job *rootOpenJob) (sendB
 		c.replanLocked(now)
 		return sendBatch{}, nil
 	}
+	job.inFlight = true
 	return sendBatch{
 		kind:       sendKindRoot,
 		role:       job.role,
@@ -744,7 +767,7 @@ func (c *chatQueue) buildRootBatchLocked(now time.Time, job *rootOpenJob) (sendB
 	}, nil
 }
 
-func (c *chatQueue) buildReplyBatchLocked(conn *connQueue) (sendBatch, error) {
+func (c *chatQueue) buildAndPopReplyBatchLocked(conn *connQueue) (sendBatch, error) {
 	if len(conn.frames) == 0 {
 		return sendBatch{}, nil
 	}
@@ -766,28 +789,41 @@ func (c *chatQueue) buildReplyBatchLocked(conn *connQueue) (sendBatch, error) {
 					Limit:  c.limit,
 				}
 			}
-			return sendBatch{
+			batch := sendBatch{
 				kind:       sendKindReply,
 				connID:     conn.connID,
 				role:       conn.role,
 				target:     conn.target,
 				frames:     cloneFrames(frames),
 				frameCount: len(frames),
-			}, nil
+			}
+			c.popReplyBatchLocked(conn, &batch)
+			return batch, nil
 		}
 		frames = candidate
 		if i == len(conn.frames)-1 {
 			break
 		}
 	}
-	return sendBatch{
+	batch := sendBatch{
 		kind:       sendKindReply,
 		connID:     conn.connID,
 		role:       conn.role,
 		target:     conn.target,
 		frames:     cloneFrames(frames),
 		frameCount: len(frames),
-	}, nil
+	}
+	c.popReplyBatchLocked(conn, &batch)
+	return batch, nil
+}
+
+func (c *chatQueue) popReplyBatchLocked(conn *connQueue, batch *sendBatch) {
+	if batch.frameCount > len(conn.frames) {
+		batch.frameCount = len(conn.frames)
+	}
+	batch.queuedFrames = cloneQueuedFrames(conn.frames[:batch.frameCount])
+	conn.frames = cloneQueuedFrames(conn.frames[batch.frameCount:])
+	conn.inFlight++
 }
 
 func (c *chatQueue) fits(target Target, frames []protocol.Frame) (bool, error) {
@@ -808,21 +844,18 @@ func (c *chatQueue) commitRootResult(ctx context.Context, batch sendBatch, root 
 	var dropReason DropReason
 	var dropCB func(context.Context, DropReason)
 	c.mu.Lock()
-	c.flushing = false
 	if job := c.rootJobs[batch.rootJobID]; job != nil {
+		job.inFlight = false
 		if err == nil {
 			delete(c.rootJobs, batch.rootJobID)
 			resultCh = job.resultCh
-			c.markAttemptLocked(now)
 		} else if lark.IsRetryableSendError(err) {
 			c.logger.Warn("outbound root send failed; retrying after cooldown", "chat_id", batch.target.ChatID, "error", err)
-			c.markAttemptLocked(now)
 		} else {
 			delete(c.rootJobs, batch.rootJobID)
 			resultCh = job.resultCh
 			dropReason = DropReason{Target: batch.target, Role: batch.role, Err: err}
 			dropCB = job.onDrop
-			c.markAttemptLocked(now)
 		}
 	}
 	c.replanLocked(now)
@@ -833,6 +866,7 @@ func (c *chatQueue) commitRootResult(ctx context.Context, batch sendBatch, root 
 	if dropCB != nil {
 		dropCB(ctx, dropReason)
 	}
+	c.notifyReschedule()
 }
 
 func (c *chatQueue) commitReplyResult(ctx context.Context, batch sendBatch, err error) {
@@ -843,25 +877,23 @@ func (c *chatQueue) commitReplyResult(ctx context.Context, batch sendBatch, err 
 	var drainedCB func(context.Context)
 	var drainedConnID string
 	c.mu.Lock()
-	c.flushing = false
 	conn := c.conns[batch.connID]
 	if conn != nil {
+		if conn.inFlight > 0 {
+			conn.inFlight--
+		}
 		switch {
 		case err == nil:
-			if batch.frameCount > len(conn.frames) {
-				batch.frameCount = len(conn.frames)
-			}
-			conn.frames = cloneQueuedFrames(conn.frames[batch.frameCount:])
 			if conn.heartbeatInterval > 0 {
 				conn.nextHeartbeatAt = now.Add(conn.heartbeatInterval)
 			}
-			c.markAttemptLocked(now)
-			if conn.closeAfterDrained && len(conn.frames) == 0 {
+			if conn.closeAfterDrained && len(conn.frames) == 0 && conn.inFlight == 0 {
 				drainedCB = conn.onDrained
 				drainedConnID = conn.connID
 				delete(c.conns, conn.connID)
 			}
 		case lark.IsRetryableSendError(err):
+			conn.frames = append(cloneQueuedFrames(batch.queuedFrames), conn.frames...)
 			c.logger.Warn(
 				"outbound reply send failed; retrying after cooldown",
 				"chat_id", batch.target.ChatID,
@@ -870,11 +902,9 @@ func (c *chatQueue) commitReplyResult(ctx context.Context, batch sendBatch, err 
 				"role", batch.role,
 				"error", err,
 			)
-			c.markAttemptLocked(now)
 		default:
 			dropReason, dropCB = c.dropConnLocked(batch.connID, err)
 			dropConnID = batch.connID
-			c.markAttemptLocked(now)
 		}
 	}
 	c.replanLocked(now)
@@ -891,6 +921,7 @@ func (c *chatQueue) commitReplyResult(ctx context.Context, batch sendBatch, err 
 	if dropCB != nil {
 		dropCB(ctx, dropReason)
 	}
+	c.notifyReschedule()
 }
 
 func (c *chatQueue) dropConnLocked(connID string, err error) (DropReason, func(context.Context, DropReason)) {
@@ -962,8 +993,10 @@ func (c *chatQueue) replanLocked(now time.Time) {
 }
 
 func (c *chatQueue) hasPendingLocked() bool {
-	if len(c.rootJobs) > 0 {
-		return true
+	for _, job := range c.rootJobs {
+		if !job.inFlight {
+			return true
+		}
 	}
 	for _, conn := range c.conns {
 		if len(conn.frames) > 0 {
